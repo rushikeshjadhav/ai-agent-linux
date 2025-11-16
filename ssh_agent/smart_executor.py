@@ -2,6 +2,7 @@ import json
 import logging
 import os
 import hashlib
+import base64
 from typing import List, Dict, Any, Optional
 from dataclasses import dataclass
 from datetime import datetime, timedelta
@@ -105,7 +106,7 @@ class SmartExecutor:
             # Convert to JSON
             json_data = json.dumps(cache_data, indent=2)
             
-            # Save to remote server using echo with proper escaping
+            # Use base64 encoding to safely transfer the JSON data
             cache_file = "/tmp/ssh_agent_env_cache.json"
             
             # First, create the cache directory if it doesn't exist
@@ -114,34 +115,34 @@ class SmartExecutor:
                 logger.warning("Cannot create /tmp directory for cache")
                 return
             
-            # Use a more reliable method to write the JSON file
-            # First write to a temporary file, then move it
-            temp_file = f"/tmp/ssh_agent_env_temp_{int(datetime.now().timestamp())}.json"
+            # Encode JSON as base64 to avoid shell escaping issues
+            json_bytes = json_data.encode('utf-8')
+            b64_data = base64.b64encode(json_bytes).decode('ascii')
             
-            # Escape the JSON data for shell
-            escaped_json = json_data.replace("'", "'\"'\"'").replace("\n", "\\n")
-            
-            # Write using printf to handle special characters better
-            write_cmd = f"printf '%s' '{escaped_json}' > {temp_file}"
+            # Write base64 data and decode it on the remote server
+            write_cmd = f"echo '{b64_data}' | base64 -d > {cache_file}"
             write_result = self.executor.execute(write_cmd)
             
             if write_result.allowed and write_result.exit_code == 0:
-                # Move temp file to final location
-                move_result = self.executor.execute(f"mv {temp_file} {cache_file}")
-                if move_result.allowed and move_result.exit_code == 0:
-                    logger.info(f"Environment cache saved to {cache_file} on remote server")
-                    
-                    # Verify the file was written correctly
-                    verify_result = self.executor.execute(f"test -f {cache_file} && wc -c {cache_file}")
-                    if verify_result.allowed and verify_result.exit_code == 0:
-                        file_size = verify_result.stdout.strip().split()[0]
-                        logger.debug(f"Cache file size: {file_size} bytes")
+                logger.info(f"Environment cache saved to {cache_file} on remote server")
+                
+                # Verify the file was written correctly by checking if it's valid JSON
+                verify_result = self.executor.execute(f"python3 -m json.tool {cache_file} > /dev/null 2>&1 && echo 'valid' || echo 'invalid'")
+                if verify_result.allowed and verify_result.exit_code == 0:
+                    if "valid" in verify_result.stdout:
+                        logger.debug("Cache file JSON validation passed")
+                        
+                        # Get file size for logging
+                        size_result = self.executor.execute(f"wc -c < {cache_file}")
+                        if size_result.allowed and size_result.exit_code == 0:
+                            file_size = size_result.stdout.strip()
+                            logger.debug(f"Cache file size: {file_size} bytes")
                     else:
-                        logger.warning("Could not verify cache file was written")
+                        logger.warning("Cache file contains invalid JSON")
+                        # Remove invalid cache file
+                        self.executor.execute(f"rm -f {cache_file}")
                 else:
-                    logger.warning(f"Failed to move temp cache file: {move_result.stderr}")
-                    # Clean up temp file
-                    self.executor.execute(f"rm -f {temp_file}")
+                    logger.debug("Could not verify cache file JSON validity")
             else:
                 logger.warning(f"Failed to write environment cache: {write_result.stderr}")
             
