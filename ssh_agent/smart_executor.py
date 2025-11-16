@@ -381,8 +381,23 @@ class SmartExecutor:
         - auto_generate: list of placeholders to generate
         
         CRITICAL: Always provide at least one step, even if it's just verification.
+        CRITICAL: Respond with ONLY valid JSON, no additional text.
         
-        Respond in JSON format with a complete action plan.
+        {{
+            "goal": "{task_description}",
+            "steps": [
+                {{
+                    "command": "actual command here",
+                    "description": "what this does",
+                    "prerequisite_basis": "which prerequisite check informed this",
+                    "skip_condition": "when to skip this step",
+                    "auto_generate": []
+                }}
+            ],
+            "risks": ["list of risks"],
+            "estimated_time": "X minutes",
+            "safety_score": 0.8
+        }}
         """
         
         try:
@@ -391,12 +406,30 @@ class SmartExecutor:
             logger.info(f"LLM response received: {len(response)} characters")
             logger.debug(f"LLM response content: {response[:500]}...")
             
-            action_plan = self.analyzer._parse_action_plan_with_placeholders(response)
+            # Parse the response using the robust JSON parser
+            fallback_data = {
+                "goal": task_description,
+                "steps": [],
+                "risks": ["Failed to parse LLM response"],
+                "estimated_time": "unknown",
+                "safety_score": 0.0
+            }
             
-            # Validate the action plan
+            parsed_data = self.analyzer._robust_json_parse(response, fallback_data)
+            
+            # Create ActionPlan from parsed data
+            action_plan = ActionPlan(
+                goal=parsed_data.get("goal", task_description),
+                steps=parsed_data.get("steps", []),
+                risks=parsed_data.get("risks", []),
+                estimated_time=parsed_data.get("estimated_time", "unknown"),
+                safety_score=float(parsed_data.get("safety_score", 0.0))
+            )
+            
+            # Validate the action plan - if no steps, create a task-specific fallback
             if not action_plan.steps:
-                logger.error("LLM returned empty action plan, creating fallback")
-                return self._create_fallback_action_plan(task_description, prerequisite_results)
+                logger.warning("LLM returned empty steps, creating task-specific fallback")
+                return self._create_task_specific_fallback(task_description, prerequisite_results)
             
             logger.info(f"Successfully created action plan with {len(action_plan.steps)} steps")
             return action_plan
@@ -404,7 +437,146 @@ class SmartExecutor:
         except Exception as e:
             logger.error(f"Failed to create informed action plan: {e}")
             logger.exception("Full traceback for action plan failure:")
-            return self._create_fallback_action_plan(task_description, prerequisite_results)
+            return self._create_task_specific_fallback(task_description, prerequisite_results)
+
+    def _create_task_specific_fallback(self, task_description: str, prerequisite_results: Dict[str, Any]) -> ActionPlan:
+        """Create a task-specific fallback plan when LLM fails to generate proper steps"""
+        logger.info("Creating task-specific fallback action plan")
+        
+        task_lower = task_description.lower()
+        fallback_steps = []
+        
+        # Handle file deletion tasks
+        if any(keyword in task_lower for keyword in ["delete", "remove", "rm"]) and "file" in task_lower:
+            # Extract file path from task description
+            import re
+            file_match = re.search(r'(/[^\s]+)', task_description)
+            file_path = file_match.group(1) if file_match else "/unknown/file"
+            
+            fallback_steps = [
+                {
+                    "command": f"ls -la {file_path}",
+                    "description": f"Check if file {file_path} exists",
+                    "prerequisite_basis": "file_directory_existence",
+                    "skip_condition": "file does not exist",
+                    "auto_generate": []
+                },
+                {
+                    "command": f"sudo rm -f {file_path}",
+                    "description": f"Remove file {file_path}",
+                    "prerequisite_basis": "user_permission_context",
+                    "skip_condition": "file already removed",
+                    "auto_generate": []
+                },
+                {
+                    "command": f"ls -la {file_path} 2>/dev/null || echo 'File successfully removed'",
+                    "description": "Verify file removal",
+                    "prerequisite_basis": "",
+                    "skip_condition": "",
+                    "auto_generate": []
+                }
+            ]
+        
+        # Handle service management tasks
+        elif any(keyword in task_lower for keyword in ["start", "stop", "restart", "enable", "disable"]) and "service" in task_lower:
+            # Extract service name
+            words = task_description.split()
+            service_name = "unknown"
+            for i, word in enumerate(words):
+                if word in ["service", "start", "stop", "restart", "enable", "disable"] and i + 1 < len(words):
+                    service_name = words[i + 1]
+                    break
+            
+            action = "start"
+            if "stop" in task_lower:
+                action = "stop"
+            elif "restart" in task_lower:
+                action = "restart"
+            elif "enable" in task_lower:
+                action = "enable"
+            elif "disable" in task_lower:
+                action = "disable"
+            
+            fallback_steps = [
+                {
+                    "command": f"systemctl status {service_name}",
+                    "description": f"Check current status of {service_name}",
+                    "prerequisite_basis": "service_status",
+                    "skip_condition": "",
+                    "auto_generate": []
+                },
+                {
+                    "command": f"sudo systemctl {action} {service_name}",
+                    "description": f"{action.title()} {service_name} service",
+                    "prerequisite_basis": "user_permission_context",
+                    "skip_condition": f"service already {action}ed" if action in ["start", "stop"] else "",
+                    "auto_generate": []
+                },
+                {
+                    "command": f"systemctl status {service_name}",
+                    "description": f"Verify {service_name} status after {action}",
+                    "prerequisite_basis": "",
+                    "skip_condition": "",
+                    "auto_generate": []
+                }
+            ]
+        
+        # Handle package installation tasks
+        elif "install" in task_lower and any(keyword in task_lower for keyword in ["package", "apt", "yum", "dnf"]):
+            # Extract package name
+            words = task_description.split()
+            package_name = words[-1] if words else "unknown"
+            
+            fallback_steps = [
+                {
+                    "command": "sudo apt update || sudo yum update || sudo dnf update || true",
+                    "description": "Update package lists",
+                    "prerequisite_basis": "package_manager",
+                    "skip_condition": "",
+                    "auto_generate": []
+                },
+                {
+                    "command": f"sudo apt install -y {package_name} || sudo yum install -y {package_name} || sudo dnf install -y {package_name}",
+                    "description": f"Install {package_name}",
+                    "prerequisite_basis": "package_manager",
+                    "skip_condition": "package already installed",
+                    "auto_generate": []
+                },
+                {
+                    "command": f"which {package_name} || dpkg -l | grep {package_name} || rpm -q {package_name} || echo 'Package verification'",
+                    "description": f"Verify {package_name} installation",
+                    "prerequisite_basis": "",
+                    "skip_condition": "",
+                    "auto_generate": []
+                }
+            ]
+        
+        # Generic fallback for other tasks
+        else:
+            fallback_steps = [
+                {
+                    "command": f"echo 'Executing task: {task_description}'",
+                    "description": "Log task execution",
+                    "prerequisite_basis": "",
+                    "skip_condition": "",
+                    "auto_generate": []
+                },
+                {
+                    "command": "echo 'Task-specific implementation needed'",
+                    "description": "Placeholder for manual implementation",
+                    "prerequisite_basis": "",
+                    "skip_condition": "",
+                    "auto_generate": []
+                }
+            ]
+        
+        return ActionPlan(
+            goal=f"Fallback plan for: {task_description}",
+            steps=fallback_steps,
+            risks=["Fallback plan - may need manual verification"],
+            estimated_time="2-5 minutes",
+            safety_score=0.7
+        )
 
     def _collect_comprehensive_environment_info(self) -> Dict[str, Any]:
         """Collect comprehensive Linux environment information for LLM planning with caching"""
@@ -2214,112 +2386,7 @@ class SmartExecutor:
     def _create_fallback_action_plan(self, task_description: str, prerequisite_results: Dict[str, Any]) -> ActionPlan:
         """Create a basic fallback action plan when LLM fails"""
         logger.info("Creating fallback action plan based on task analysis")
-        
-        # Analyze the task to create basic steps
-        task_lower = task_description.lower()
-        fallback_steps = []
-        
-        if "remove" in task_lower and "cron" in task_lower:
-            # Extract cron file name from task
-            import re
-            cron_match = re.search(r'cron.*?(\S+)', task_description)
-            cron_file = cron_match.group(1) if cron_match else "unknown"
-            
-            fallback_steps = [
-                {
-                    "command": f"sudo ls -l /etc/cron.d/{cron_file}",
-                    "description": f"Verify cron file {cron_file} exists",
-                    "prerequisite_basis": "file_directory_existence",
-                    "skip_condition": "",
-                    "auto_generate": []
-                },
-                {
-                    "command": f"sudo rm -f /etc/cron.d/{cron_file}",
-                    "description": f"Remove cron file {cron_file}",
-                    "prerequisite_basis": "user_permission_context",
-                    "skip_condition": "",
-                    "auto_generate": []
-                },
-                {
-                    "command": f"ls /etc/cron.d/{cron_file} 2>/dev/null || echo 'File removed successfully'",
-                    "description": "Verify file removal",
-                    "prerequisite_basis": "",
-                    "skip_condition": "",
-                    "auto_generate": []
-                }
-            ]
-        
-        elif "install" in task_lower:
-            # Extract package name if possible
-            words = task_description.split()
-            package = words[-1] if words else "unknown"
-            
-            fallback_steps = [
-                {
-                    "command": f"sudo apt update || sudo yum update || true",
-                    "description": "Update package lists",
-                    "prerequisite_basis": "",
-                    "skip_condition": "",
-                    "auto_generate": []
-                },
-                {
-                    "command": f"sudo apt install -y {package} || sudo yum install -y {package}",
-                    "description": f"Install {package}",
-                    "prerequisite_basis": "",
-                    "skip_condition": "",
-                    "auto_generate": []
-                }
-            ]
-        
-        elif "start" in task_lower or "restart" in task_lower:
-            # Extract service name if possible
-            words = task_description.split()
-            service = words[-1] if words else "unknown"
-            action = "start" if "start" in task_lower else "restart"
-            
-            fallback_steps = [
-                {
-                    "command": f"sudo systemctl {action} {service}",
-                    "description": f"{action.title()} {service} service",
-                    "prerequisite_basis": "",
-                    "skip_condition": "",
-                    "auto_generate": []
-                },
-                {
-                    "command": f"sudo systemctl status {service}",
-                    "description": f"Verify {service} status",
-                    "prerequisite_basis": "",
-                    "skip_condition": "",
-                    "auto_generate": []
-                }
-            ]
-        
-        else:
-            # Generic fallback
-            fallback_steps = [
-                {
-                    "command": "echo 'Analyzing task requirements...'",
-                    "description": "Task analysis step",
-                    "prerequisite_basis": "",
-                    "skip_condition": "",
-                    "auto_generate": []
-                },
-                {
-                    "command": f"echo 'Task: {task_description}' | logger -t ssh_agent",
-                    "description": "Log task attempt",
-                    "prerequisite_basis": "",
-                    "skip_condition": "",
-                    "auto_generate": []
-                }
-            ]
-        
-        return ActionPlan(
-            goal=f"Fallback plan for: {task_description}",
-            steps=fallback_steps,
-            risks=["Fallback plan - may not be optimal"],
-            estimated_time="1-3 minutes",
-            safety_score=0.8
-        )
+        return self._create_task_specific_fallback(task_description, prerequisite_results)
 
     def _create_planning_failure_recovery_plan(self, failed_result: TaskResult, original_task: str) -> ActionPlan:
         """Create recovery plan for planning failures (when LLM can't generate initial plan)"""
