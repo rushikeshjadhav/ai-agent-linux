@@ -132,13 +132,25 @@ class SSHAgentCLI:
         hostname, username, port = self.prompt_server_details()
         mode = self.prompt_agent_mode()
         
-        # Check for LLM API keys if intelligent mode
-        if mode == AgentMode.INTELLIGENT:
-            if not (os.getenv("OPENAI_API_KEY") or os.getenv("ANTHROPIC_API_KEY")):
-                print("⚠️ Warning: No LLM API key found. Set OPENAI_API_KEY or ANTHROPIC_API_KEY for full intelligent features.")
+        # Auto-detect LLM provider based on available API keys
+        llm_provider = None
+        llm_api_key = None
         
-        # Create agent
-        self.agent = SSHAgent(hostname, username, mode, port)
+        if os.getenv("OPENAI_API_KEY"):
+            llm_provider = LLMProvider.OPENAI
+            llm_api_key = os.getenv("OPENAI_API_KEY")
+            print("🤖 Using OpenAI for LLM features")
+        elif os.getenv("ANTHROPIC_API_KEY"):
+            llm_provider = LLMProvider.ANTHROPIC
+            llm_api_key = os.getenv("ANTHROPIC_API_KEY")
+            print("🤖 Using Anthropic for LLM features")
+        elif mode == AgentMode.INTELLIGENT:
+            print("⚠️ Warning: No LLM API key found. Set OPENAI_API_KEY or ANTHROPIC_API_KEY for full intelligent features.")
+            print("🔄 Falling back to OpenAI provider (will fail without API key)")
+            llm_provider = LLMProvider.OPENAI
+        
+        # Create agent with detected LLM provider
+        self.agent = SSHAgent(hostname, username, mode, port, llm_provider, llm_api_key)
         
         # Choose connection method
         method = self.prompt_connection_method()
@@ -235,21 +247,28 @@ class SSHAgentCLI:
                     break
                 
                 elif task.lower() == 'health':
+                    if not (os.getenv("OPENAI_API_KEY") or os.getenv("ANTHROPIC_API_KEY")):
+                        print("❌ Health analysis requires an LLM API key (OPENAI_API_KEY or ANTHROPIC_API_KEY)")
+                        continue
+                    
                     print("🏥 Analyzing server health...")
-                    analysis = self.agent.analyze_server_health()
-                    print(f"📋 Summary: {analysis.summary}")
-                    print(f"⚠️ Severity: {analysis.severity}")
-                    print(f"🎯 Confidence: {analysis.confidence}")
-                    
-                    if analysis.issues:
-                        print("🚨 Issues:")
-                        for issue in analysis.issues:
-                            print(f"  - {issue}")
-                    
-                    if analysis.recommendations:
-                        print("💡 Recommendations:")
-                        for rec in analysis.recommendations:
-                            print(f"  - {rec}")
+                    try:
+                        analysis = self.agent.analyze_server_health()
+                        print(f"📋 Summary: {analysis.summary}")
+                        print(f"⚠️ Severity: {analysis.severity}")
+                        print(f"🎯 Confidence: {analysis.confidence}")
+                        
+                        if analysis.issues:
+                            print("🚨 Issues:")
+                            for issue in analysis.issues:
+                                print(f"  - {issue}")
+                        
+                        if analysis.recommendations:
+                            print("💡 Recommendations:")
+                            for rec in analysis.recommendations:
+                                print(f"  - {rec}")
+                    except Exception as e:
+                        print(f"❌ Health analysis failed: {e}")
                 
                 elif task.lower() == 'context':
                     print("📊 Server Context:")
