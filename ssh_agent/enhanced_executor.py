@@ -217,8 +217,14 @@ class EnhancedExecutor:
             }
     
     def _collect_prerequisites(self, understanding: Dict[str, Any]) -> Dict[str, Any]:
-        """Collect system state and prerequisites"""
+        """Collect comprehensive system state and prerequisites"""
+        # Use the smart executor's environment collection method
+        from .smart_executor import SmartExecutor
+        temp_smart_executor = SmartExecutor(self.executor, self.analyzer, self.context)
+        env_info = temp_smart_executor._collect_comprehensive_environment_info()
+        
         prerequisites = {
+            "environment": env_info,
             "system_info": {},
             "package_state": {},
             "service_state": {},
@@ -227,7 +233,7 @@ class EnhancedExecutor:
             "permissions": {}
         }
         
-        # Collect system information
+        # Add basic system information
         system_commands = [
             "uname -a",
             "cat /etc/os-release",
@@ -243,13 +249,8 @@ class EnhancedExecutor:
             if result.allowed and result.exit_code == 0:
                 prerequisites["system_info"][cmd] = result.stdout
         
-        # Collect package manager info
-        pkg_managers = ["apt", "yum", "dnf", "pacman"]
-        for pm in pkg_managers:
-            result = self.executor.execute(f"which {pm}")
-            if result.allowed and result.exit_code == 0:
-                prerequisites["package_state"]["manager"] = pm
-                break
+        # The environment info already contains package manager details
+        prerequisites["package_state"] = env_info.get("package_manager", {})
         
         # Collect service information if needed
         if understanding.get("category") == "service_management":

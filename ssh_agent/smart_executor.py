@@ -60,6 +60,137 @@ class SmartExecutor:
         self.max_recovery_attempts = 2
         self.failure_contexts: List[FailureContext] = []
     
+    def _collect_comprehensive_environment_info(self) -> Dict[str, Any]:
+        """Collect comprehensive Linux environment information for LLM planning"""
+        env_info = {
+            "distribution": {},
+            "package_manager": {},
+            "available_tools": {},
+            "system_resources": {},
+            "network_info": {},
+            "user_context": {},
+            "filesystem_info": {}
+        }
+        
+        # Distribution information
+        dist_commands = [
+            ("os_release", "cat /etc/os-release"),
+            ("lsb_release", "lsb_release -a 2>/dev/null || echo 'lsb_release not available'"),
+            ("redhat_release", "cat /etc/redhat-release 2>/dev/null || echo 'not redhat'"),
+            ("debian_version", "cat /etc/debian_version 2>/dev/null || echo 'not debian'"),
+            ("kernel", "uname -r"),
+            ("architecture", "uname -m")
+        ]
+        
+        for key, cmd in dist_commands:
+            result = self.executor.execute(cmd)
+            if result.allowed and result.exit_code == 0:
+                env_info["distribution"][key] = result.stdout.strip()
+        
+        # Package manager detection and info
+        pkg_managers = [
+            ("apt", "apt --version 2>/dev/null"),
+            ("yum", "yum --version 2>/dev/null"),
+            ("dnf", "dnf --version 2>/dev/null"),
+            ("pacman", "pacman --version 2>/dev/null"),
+            ("zypper", "zypper --version 2>/dev/null"),
+            ("apk", "apk --version 2>/dev/null")
+        ]
+        
+        for manager, cmd in pkg_managers:
+            result = self.executor.execute(cmd)
+            if result.allowed and result.exit_code == 0:
+                env_info["package_manager"][manager] = {
+                    "available": True,
+                    "version": result.stdout.strip()[:100]
+                }
+                # Get repository info for available package managers
+                if manager == "apt":
+                    repo_result = self.executor.execute("apt-cache policy | head -20")
+                    if repo_result.allowed and repo_result.exit_code == 0:
+                        env_info["package_manager"][manager]["repositories"] = repo_result.stdout
+                elif manager == "yum":
+                    repo_result = self.executor.execute("yum repolist")
+                    if repo_result.allowed and repo_result.exit_code == 0:
+                        env_info["package_manager"][manager]["repositories"] = repo_result.stdout
+            else:
+                env_info["package_manager"][manager] = {"available": False}
+        
+        # Available tools and commands
+        common_tools = [
+            "curl", "wget", "git", "vim", "nano", "htop", "tree", "unzip", "zip",
+            "docker", "nginx", "apache2", "mysql", "python3", "pip", "node", "npm",
+            "java", "gcc", "make", "systemctl", "service", "crontab", "iptables",
+            "ufw", "firewall-cmd", "ss", "netstat", "rsync", "tar", "gzip"
+        ]
+        
+        for tool in common_tools:
+            result = self.executor.execute(f"which {tool} 2>/dev/null && {tool} --version 2>/dev/null | head -1")
+            if result.allowed and result.exit_code == 0:
+                env_info["available_tools"][tool] = {
+                    "available": True,
+                    "path": result.stdout.split('\n')[0] if result.stdout else "unknown",
+                    "version": result.stdout.split('\n')[1] if len(result.stdout.split('\n')) > 1 else "unknown"
+                }
+            else:
+                env_info["available_tools"][tool] = {"available": False}
+        
+        # System resources
+        resource_commands = [
+            ("memory", "free -h"),
+            ("disk_space", "df -h"),
+            ("cpu_info", "cat /proc/cpuinfo | grep 'model name' | head -1"),
+            ("load_average", "uptime"),
+            ("running_processes", "ps aux | wc -l")
+        ]
+        
+        for key, cmd in resource_commands:
+            result = self.executor.execute(cmd)
+            if result.allowed and result.exit_code == 0:
+                env_info["system_resources"][key] = result.stdout.strip()
+        
+        # Network information
+        network_commands = [
+            ("interfaces", "ip addr show | grep -E '^[0-9]+:' | head -5"),
+            ("routing", "ip route | head -5"),
+            ("dns", "cat /etc/resolv.conf | grep nameserver"),
+            ("connectivity", "ping -c 1 8.8.8.8 2>/dev/null && echo 'internet_ok' || echo 'no_internet'")
+        ]
+        
+        for key, cmd in network_commands:
+            result = self.executor.execute(cmd)
+            if result.allowed and result.exit_code == 0:
+                env_info["network_info"][key] = result.stdout.strip()
+        
+        # User and permission context
+        user_commands = [
+            ("current_user", "whoami"),
+            ("user_id", "id"),
+            ("sudo_access", "sudo -n true 2>/dev/null && echo 'has_sudo' || echo 'no_sudo'"),
+            ("home_directory", "echo $HOME"),
+            ("current_directory", "pwd"),
+            ("shell", "echo $SHELL")
+        ]
+        
+        for key, cmd in user_commands:
+            result = self.executor.execute(cmd)
+            if result.allowed and result.exit_code == 0:
+                env_info["user_context"][key] = result.stdout.strip()
+        
+        # Filesystem information
+        fs_commands = [
+            ("mount_points", "mount | head -10"),
+            ("filesystem_types", "df -T"),
+            ("disk_usage_summary", "du -sh /var /tmp /home 2>/dev/null | head -5")
+        ]
+        
+        for key, cmd in fs_commands:
+            result = self.executor.execute(cmd)
+            if result.allowed and result.exit_code == 0:
+                env_info["filesystem_info"][key] = result.stdout.strip()
+        
+        return env_info
+    
     def execute_task(self, task_description: str, auto_approve: bool = False) -> TaskResult:
         """Break down complex tasks into commands using LLM with recursive failure recovery"""
         logger.info(f"Starting smart task execution: {task_description}")
@@ -134,12 +265,23 @@ class SmartExecutor:
         return result
     
     def _execute_task_attempt(self, task_description: str, auto_approve: bool = False) -> TaskResult:
-        """Execute a single task attempt"""
+        """Execute a single task attempt with comprehensive environment info"""
+        # Collect comprehensive environment information
+        logger.info("Collecting comprehensive environment information...")
+        env_info = self._collect_comprehensive_environment_info()
+        
         # Get current system state
         current_state = self.context.get_current_state()
         
-        # Get LLM action plan
-        action_plan = self.analyzer.suggest_actions(task_description, current_state)
+        # Combine environment info with current state
+        comprehensive_state = {
+            "environment": env_info,
+            "current_state": current_state,
+            "task_description": task_description
+        }
+        
+        # Get LLM action plan with full environment context
+        action_plan = self.analyzer.suggest_actions(task_description, comprehensive_state)
         
         if not action_plan.steps:
             return TaskResult(
@@ -159,8 +301,8 @@ class SmartExecutor:
             else:
                 commands.append(str(step))
         
-        # Validate action plan safety
-        validation = self.analyzer.validate_action_plan(commands, current_state)
+        # Validate action plan safety with environment context
+        validation = self.analyzer.validate_action_plan(commands, comprehensive_state)
         
         if not validation.get("safe", False) and not auto_approve:
             return TaskResult(
@@ -525,8 +667,20 @@ class SmartExecutor:
 
     def _create_command_not_found_prompt(self, original_task: str, failed_result: CommandResult, 
                                        failure_analysis: Dict[str, Any], current_state: Dict[str, Any]) -> str:
-        """Create specific prompt for command not found errors"""
+        """Create specific prompt for command not found errors with environment context"""
         missing_package = failure_analysis.get("missing_package", "unknown")
+        
+        # Extract environment info
+        env_info = current_state.get("environment", {})
+        distribution = env_info.get("distribution", {})
+        package_managers = env_info.get("package_manager", {})
+        available_tools = env_info.get("available_tools", {})
+        
+        # Determine the best package manager
+        available_pm = []
+        for pm, info in package_managers.items():
+            if info.get("available", False):
+                available_pm.append(pm)
         
         return f"""
         COMMAND NOT FOUND ERROR - Need Recovery Plan
@@ -534,33 +688,52 @@ class SmartExecutor:
         Original Task: {original_task}
         Failed Command: {failed_result.command}
         Error: {failed_result.stderr}
+        Missing Command: {failed_result.command.split()[0]}
         
-        Analysis: The command '{failed_result.command.split()[0]}' was not found.
-        Likely missing package: {missing_package}
+        LINUX ENVIRONMENT DETAILS:
+        Distribution: {distribution.get('os_release', 'Unknown')}
+        Kernel: {distribution.get('kernel', 'Unknown')}
+        Architecture: {distribution.get('architecture', 'Unknown')}
         
-        Current System State:
-        - Package Manager: {current_state.get('known_packages', {}).get('manager', 'unknown')}
-        - System Info: {json.dumps(current_state.get('current_state', {}), indent=2)[:500]}
+        Available Package Managers: {available_pm}
+        Package Manager Details:
+        {json.dumps(package_managers, indent=2)}
+        
+        Available Tools:
+        {json.dumps({k: v for k, v in available_tools.items() if v.get('available', False)}, indent=2)}
+        
+        User Context:
+        {json.dumps(env_info.get('user_context', {}), indent=2)}
+        
+        System Resources:
+        {json.dumps(env_info.get('system_resources', {}), indent=2)}
         
         Create a recovery plan that:
-        1. First tries to install the missing package ({missing_package})
-        2. If installation fails, finds alternative commands/packages
-        3. If no alternatives work, revises the original task to work without this tool
-        4. Includes verification steps to ensure each step works
+        1. Uses the CORRECT package manager for this distribution
+        2. Installs the missing package ({missing_package}) using distribution-specific commands
+        3. If the package name is wrong for this distribution, finds the correct package name
+        4. If installation fails, finds alternative commands/packages available on this system
+        5. If no alternatives work, revises the original task using available tools
         
-        IMPORTANT: 
-        - Include package installation commands (apt install, yum install, etc.)
-        - Include alternative approaches if the package doesn't exist
-        - Include a fallback plan that accomplishes the original goal differently
+        IMPORTANT DISTRIBUTION-SPECIFIC CONSIDERATIONS:
+        - For Ubuntu/Debian: use apt/apt-get
+        - For RHEL/CentOS/Fedora: use yum/dnf
+        - For Arch: use pacman
+        - For SUSE: use zypper
+        - For Alpine: use apk
         
-        Example recovery steps:
-        1. Update package lists: "apt update" or "yum update"
-        2. Install package: "apt install -y {missing_package}" or "yum install -y {missing_package}"
+        Package name variations by distribution:
+        - docker: docker.io (Ubuntu), docker-ce (RHEL), docker (Arch)
+        - apache: apache2 (Debian), httpd (RHEL)
+        - nginx: nginx (most), nginx-mainline (some)
+        
+        Example recovery steps for this environment:
+        1. Update package lists: "{available_pm[0] if available_pm else 'apt'} update"
+        2. Install package: "{available_pm[0] if available_pm else 'apt'} install -y {missing_package}"
         3. Verify installation: "which {failed_result.command.split()[0]}"
-        4. If still fails, try alternative: [suggest alternative commands]
-        5. If no alternatives, modify approach: [suggest different way to achieve goal]
+        4. If fails, try alternatives based on available tools
         
-        Respond in JSON format with detailed steps.
+        Respond in JSON format with detailed, distribution-specific steps.
         """
 
     def _create_package_not_available_prompt(self, original_task: str, failed_result: CommandResult,

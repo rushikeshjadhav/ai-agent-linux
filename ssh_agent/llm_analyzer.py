@@ -107,7 +107,7 @@ class ServerStateAnalyzer:
             )
     
     def suggest_actions(self, issue_description: str, current_state: Dict[str, Any]) -> ActionPlan:
-        """Get LLM suggestions for resolving issues"""
+        """Get LLM suggestions for resolving issues with full environment context"""
         if not self._client:
             return ActionPlan(
                 goal=issue_description,
@@ -117,27 +117,52 @@ class ServerStateAnalyzer:
                 safety_score=0.0
             )
         
-        state_summary = json.dumps(current_state, indent=2)
+        # Extract environment information
+        env_info = current_state.get("environment", {})
         
         prompt = f"""
-        Create an action plan to resolve this server issue:
+        Create a detailed action plan to resolve this server issue with full environment awareness:
         
-        Issue: {issue_description}
+        Issue/Goal: {issue_description}
         
-        Current system state:
-        {state_summary}
+        LINUX ENVIRONMENT DETAILS:
+        =========================
+        Distribution: {json.dumps(env_info.get('distribution', {}), indent=2)}
         
-        Provide a detailed action plan with:
+        Package Managers: {json.dumps(env_info.get('package_manager', {}), indent=2)}
+        
+        Available Tools: {json.dumps(env_info.get('available_tools', {}), indent=2)}
+        
+        System Resources: {json.dumps(env_info.get('system_resources', {}), indent=2)}
+        
+        User Context: {json.dumps(env_info.get('user_context', {}), indent=2)}
+        
+        Network Info: {json.dumps(env_info.get('network_info', {}), indent=2)}
+        
+        Current System State: {json.dumps(current_state.get('current_state', {}), indent=2)}
+        
+        REQUIREMENTS:
+        1. Use ONLY the package managers and tools that are actually available on this system
+        2. Use distribution-specific package names and commands
+        3. Consider the user's permission level (sudo access, current user)
+        4. Account for system resources (disk space, memory)
+        5. Use appropriate commands for the detected Linux distribution
+        
+        Create an action plan with:
         1. Goal description
-        2. Step-by-step commands with explanations
-        3. Potential risks
+        2. Step-by-step commands that work on THIS specific system
+        3. Potential risks specific to this environment
         4. Estimated time to complete
-        5. Safety score (0.0-1.0, where 1.0 is completely safe)
+        5. Safety score (0.0-1.0)
         
         Each step should include:
-        - command: the exact command to run
+        - command: exact command that works on this distribution
         - description: what this command does
-        - safety_check: any verification to do before/after
+        - prerequisite_check: command to verify prerequisites
+        - safety_check: verification command
+        - alternative: alternative command if the first fails
+        
+        CRITICAL: Ensure all commands are compatible with the detected Linux distribution and available tools.
         
         Respond in JSON format.
         """
