@@ -56,9 +56,9 @@ class CommandValidator:
         if not command:
             return False, "Empty command"
         
-        if self.mode == AgentMode.READ_WRITE:
-            # In RW mode, all commands are allowed
-            return True, "RW mode allows all commands"
+        if self.mode in [AgentMode.READ_WRITE, AgentMode.INTELLIGENT]:
+            # In RW and INTELLIGENT modes, all commands are allowed
+            return True, f"{self.mode.value} mode allows all commands"
         
         # RO mode validation
         first_word = command.split()[0]

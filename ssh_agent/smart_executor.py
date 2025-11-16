@@ -65,8 +65,15 @@ class SmartExecutor:
                 error_message="No action plan generated"
             )
         
+        # Extract commands for validation
+        commands = []
+        for step in action_plan.steps:
+            if isinstance(step, dict):
+                commands.append(step.get("command", ""))
+            else:
+                commands.append(str(step))
+        
         # Validate action plan safety
-        commands = [step.get("command", "") for step in action_plan.steps]
         validation = self.analyzer.validate_action_plan(commands, current_state)
         
         if not validation.get("safe", False) and not auto_approve:
@@ -84,8 +91,13 @@ class SmartExecutor:
         completed_steps = 0
         
         for i, step in enumerate(action_plan.steps):
-            command = step.get("command", "")
-            description = step.get("description", "")
+            # Handle both string and dict step formats
+            if isinstance(step, dict):
+                command = step.get("command", "")
+                description = step.get("description", "")
+            else:
+                command = str(step)
+                description = command
             
             logger.info(f"Executing step {i+1}/{len(action_plan.steps)}: {description}")
             
@@ -104,9 +116,9 @@ class SmartExecutor:
                 logger.error(f"Step {i+1} blocked: {result.reason}")
                 break
             
-            if result.exit_code != 0:
+            if result.exit_code != 0 and not auto_approve:
                 logger.error(f"Step {i+1} failed with exit code {result.exit_code}")
-                # For now, continue with other steps, but this could be configurable
+                break
             
             completed_steps += 1
         
