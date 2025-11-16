@@ -976,19 +976,6 @@ class SmartExecutor:
             # If recovery plan fails, create fallback plan
             if not recovery_plan.steps:
                 return self._create_fallback_plan(original_task, failure_analysis)
-    
-            def _should_invalidate_cache(self, task_description: str) -> bool:
-                """Determine if a task might change system state and require cache invalidation"""
-                system_changing_keywords = [
-                    "install", "remove", "uninstall", "update", "upgrade",
-                    "configure", "setup", "create user", "delete user",
-                    "start service", "stop service", "restart service",
-                    "enable service", "disable service", "mount", "unmount",
-                    "partition", "format", "network", "firewall", "iptables"
-                ]
-        
-                task_lower = task_description.lower()
-                return any(keyword in task_lower for keyword in system_changing_keywords)
             
             return recovery_plan
             
