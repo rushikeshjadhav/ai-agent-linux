@@ -484,42 +484,68 @@ class SmartExecutor:
 
     def _consult_llm_for_step_validation(self, step: Dict[str, Any], result: CommandResult, 
                                        original_goal: str) -> Dict[str, Any]:
-        """Consult LLM to determine if step failure should stop execution"""
-        command = step.get("command", "") if isinstance(step, dict) else str(step)
-        description = step.get("description", "") if isinstance(step, dict) else ""
+        """Enhanced LLM consultation with comprehensive failure context"""
+        
+        # Create enhanced failure context
+        enhanced_context = self._create_enhanced_failure_context(
+            result, step, original_goal, [result]
+        )
+        
+        # Use LLM analyzer for command analysis
+        command_analysis = self.analyzer.analyze_command_for_missing_info(
+            result.command,
+            result.stderr,
+            enhanced_context
+        )
         
         prompt = f"""
-        A command in an execution plan has failed. Determine if this failure should stop the entire plan or if we can continue.
+        A command in an execution plan has failed. Analyze the failure and provide guidance.
         
+        FAILURE ANALYSIS:
+        =================
         Original Goal: {original_goal}
-        Failed Step: {description}
-        Failed Command: {command}
-        Exit Code: {result.exit_code}
-        Error Output: {result.stderr}
-        Standard Output: {result.stdout}
+        Failed Step: {enhanced_context['step_description']}
         
-        Analyze this failure and determine:
-        1. Is the intended outcome of this step already achieved? (e.g., user already exists, package already installed)
-        2. Is this a benign failure that shouldn't stop the plan?
-        3. Is this a critical failure that requires stopping?
-        4. Can the remaining steps still be executed successfully?
+        Command Details:
+        - Command: {enhanced_context['failure_details']['command']}
+        - Exit Code: {enhanced_context['failure_details']['exit_code']}
+        - Error Output: {enhanced_context['failure_details']['stderr']}
+        - Standard Output: {enhanced_context['failure_details']['stdout']}
         
-        Common scenarios to consider:
-        - User/group already exists (usually safe to continue)
-        - Package already installed (safe to continue)
-        - Service already running (safe to continue)
-        - File already exists (depends on context)
-        - Permission denied (usually critical)
-        - Command not found (usually critical)
-        - Network/connectivity issues (usually critical)
+        LLM Command Analysis:
+        - Missing Info: {command_analysis.get('missing_info', [])}
+        - Corrected Command: {command_analysis.get('corrected_command', '')}
+        - Auto Generate: {command_analysis.get('auto_generate', [])}
+        - Explanation: {command_analysis.get('explanation', '')}
+        - Confidence: {command_analysis.get('confidence', 0.0)}
+        
+        Missing Information Analysis:
+        - Missing Parameters: {enhanced_context['missing_info_analysis']['missing_parameters']}
+        - Incomplete Command: {enhanced_context['missing_info_analysis']['incomplete_command']}
+        - Requires Generation: {enhanced_context['missing_info_analysis']['requires_generation']}
+        
+        Previous Context:
+        {json.dumps(enhanced_context['previous_context'], indent=2)}
+        
+        DECISION FRAMEWORK:
+        ===================
+        - If missing info can be auto-generated: CONTINUE with corrected command
+        - If command syntax is wrong: CONTINUE with corrected command
+        - If goal already achieved: CONTINUE and mark as achieved
+        - If critical system error: STOP execution
+        - If permission error: ANALYZE if alternative approach exists
         
         Respond in JSON format:
         {{
             "continue": true/false,
-            "reason": "explanation of decision",
+            "reason": "detailed explanation of decision",
             "step_achieved": true/false,
             "confidence": 0.8,
-            "alternative_verification": "command to verify if step goal was achieved"
+            "root_cause": "specific cause of failure",
+            "corrected_command": "fixed command with placeholders",
+            "auto_generate": ["list of items that can be auto-generated"],
+            "alternative_approach": "different way to achieve the same goal",
+            "verification_command": "command to verify if goal was achieved"
         }}
         """
         
@@ -527,30 +553,67 @@ class SmartExecutor:
             response = self.analyzer._call_llm(prompt)
             validation_result = json.loads(response)
             
-            # If LLM suggests an alternative verification, try it
-            alt_verification = validation_result.get("alternative_verification", "")
-            if alt_verification and validation_result.get("continue", False):
-                verify_result = self.executor.execute(alt_verification)
-                if verify_result.allowed and verify_result.exit_code == 0:
-                    validation_result["verification_passed"] = True
-                    validation_result["verification_output"] = verify_result.stdout
-                else:
-                    validation_result["verification_passed"] = False
-                    # If verification fails, be more conservative
-                    if validation_result.get("confidence", 0) < 0.8:
-                        validation_result["continue"] = False
-                        validation_result["reason"] += " (verification failed)"
+            # Use the LLM analyzer's corrected command if validation doesn't provide one
+            if not validation_result.get("corrected_command") and command_analysis.get("corrected_command"):
+                validation_result["corrected_command"] = command_analysis["corrected_command"]
+                validation_result["auto_generate"] = command_analysis.get("auto_generate", [])
+            
+            # If LLM suggests auto-generation, try to generate missing info
+            auto_generate = validation_result.get("auto_generate", [])
+            corrected_command = validation_result.get("corrected_command", "")
+            
+            if auto_generate and corrected_command:
+                logger.info(f"Attempting to auto-generate: {auto_generate}")
+                
+                # Generate missing information
+                generated_values = {}
+                for item in auto_generate:
+                    try:
+                        generated_value = self._generate_missing_information(item, enhanced_context)
+                        generated_values[item] = generated_value
+                        logger.info(f"Generated {item}: {generated_value[:20]}...")
+                    except Exception as e:
+                        logger.error(f"Failed to generate {item}: {e}")
+                        continue
+                
+                # Substitute generated values into corrected command
+                if generated_values:
+                    final_command = corrected_command
+                    for item, value in generated_values.items():
+                        # Replace various placeholder formats
+                        placeholders = [f"<{item}>", f"{{{item}}}", f"<{item.upper()}>", f"{{{item.upper()}}}"]
+                        for placeholder in placeholders:
+                            final_command = final_command.replace(placeholder, value)
+                    
+                    validation_result["generated_command"] = final_command
+                    validation_result["generated_values"] = generated_values
+            
+            # Try verification command if provided
+            verification_cmd = validation_result.get("verification_command", "")
+            if verification_cmd:
+                verify_result = self.executor.execute(verification_cmd)
+                validation_result["verification_result"] = {
+                    "exit_code": verify_result.exit_code,
+                    "stdout": verify_result.stdout,
+                    "stderr": verify_result.stderr
+                }
+                
+                # Adjust decision based on verification
+                if verify_result.exit_code == 0:
+                    validation_result["step_achieved"] = True
+                    validation_result["continue"] = True
+                    validation_result["reason"] += " (verified goal already achieved)"
             
             return validation_result
             
         except Exception as e:
-            logger.error(f"LLM step validation failed: {e}")
-            # Default to conservative approach - stop on failure
+            logger.error(f"Enhanced LLM validation failed: {e}")
             return {
                 "continue": False,
                 "reason": f"LLM validation failed: {str(e)}",
                 "step_achieved": False,
-                "confidence": 0.0
+                "confidence": 0.0,
+                "root_cause": "analysis_failed"
             }
     
     def _execute_recovery_plan(self, recovery_plan: ActionPlan, auto_approve: bool = False) -> TaskResult:

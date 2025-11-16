@@ -249,6 +249,17 @@ class SSHAgentCLI:
                     print(f"  {i}. {status} {cmd_result.command}")
                     if cmd_result.exit_code != 0:
                         print(f"     Error: {cmd_result.stderr[:100]}...")
+                    
+                    # Show auto-generated values if any
+                    if hasattr(cmd_result, 'validation_info'):
+                        validation_info = cmd_result.validation_info
+                        generated_values = validation_info.get('generated_values', {})
+                        if generated_values:
+                            print(f"     🔧 Auto-generated: {', '.join(generated_values.keys())}")
+                        
+                        generated_command = validation_info.get('generated_command', '')
+                        if generated_command and generated_command != cmd_result.command:
+                            print(f"     🔄 Corrected to: {generated_command}")
             
             # Show skipped steps if any
             if hasattr(result, 'skipped_steps') and result.skipped_steps:
@@ -256,6 +267,16 @@ class SSHAgentCLI:
                 for skip in result.skipped_steps:
                     print(f"  {skip['step']}. ✅ {skip['description']}")
                     print(f"     Reason: {skip['reason']}")
+            
+            # Show auto-generation summary
+            auto_generated_items = []
+            for cmd_result in result.results:
+                if hasattr(cmd_result, 'validation_info'):
+                    generated_values = cmd_result.validation_info.get('generated_values', {})
+                    auto_generated_items.extend(generated_values.keys())
+            
+            if auto_generated_items:
+                print(f"\n🎲 Auto-generated: {', '.join(set(auto_generated_items))}")
         
         else:
             # For other modes, treat as direct command

@@ -108,6 +108,10 @@ class ServerStateAnalyzer:
     
     def suggest_actions(self, issue_description: str, current_state: Dict[str, Any]) -> ActionPlan:
         """Get LLM suggestions for resolving issues with full environment context"""
+        return self.suggest_actions_with_placeholders(issue_description, current_state)
+    
+    def suggest_actions_with_placeholders(self, issue_description: str, current_state: Dict[str, Any]) -> ActionPlan:
+        """Enhanced action planning with support for auto-generated placeholders"""
         if not self._client:
             return ActionPlan(
                 goal=issue_description,
@@ -121,7 +125,7 @@ class ServerStateAnalyzer:
         env_info = current_state.get("environment", {})
         
         prompt = f"""
-        Create a detailed action plan to resolve this server issue with full environment awareness:
+        Create a detailed action plan to resolve this server issue with full environment awareness and auto-generation support:
         
         Issue/Goal: {issue_description}
         
@@ -147,31 +151,52 @@ class ServerStateAnalyzer:
         3. Consider the user's permission level (sudo access, current user)
         4. Account for system resources (disk space, memory)
         5. Use appropriate commands for the detected Linux distribution
+        6. Use placeholders for values that should be auto-generated
+        
+        PLACEHOLDER SYSTEM:
+        ===================
+        For commands that require generated values, use these placeholders:
+        - <password> or {{password}} for secure passwords (12+ chars, mixed case, numbers, symbols)
+        - <random_string> for random alphanumeric strings
+        - <timestamp> for current timestamp
+        - <temp_file> for temporary filenames
+        - <secure_key> for cryptographic keys
+        - <random_port> for available port numbers
+        
+        COMMAND EXAMPLES WITH PLACEHOLDERS:
+        - User creation with password: "useradd username && echo 'username:<password>' | chpasswd"
+        - Service with random config: "echo 'config_value=<random_string>' > /etc/service.conf"
+        - Backup with timestamp: "tar -czf backup_<timestamp>.tar.gz /data"
         
         Create an action plan with:
         1. Goal description
         2. Step-by-step commands that work on THIS specific system
-        3. Potential risks specific to this environment
-        4. Estimated time to complete
-        5. Safety score (0.0-1.0)
+        3. Use placeholders where values need to be generated
+        4. Potential risks specific to this environment
+        5. Estimated time to complete
+        6. Safety score (0.0-1.0)
         
         Each step should include:
-        - command: exact command that works on this distribution
+        - command: exact command with placeholders where needed
         - description: what this command does
         - prerequisite_check: command to verify prerequisites
         - safety_check: verification command
-        - alternative: alternative command if the first fails
+        - auto_generate: list of placeholder types that need generation
+        - success_verification: command to verify the step succeeded
         
-        CRITICAL: Ensure all commands are compatible with the detected Linux distribution and available tools.
+        CRITICAL: 
+        - Ensure all commands are compatible with the detected Linux distribution
+        - Use placeholders instead of asking for user input
+        - Make commands complete and executable once placeholders are replaced
         
         Respond in JSON format.
         """
         
         try:
             response = self._call_llm(prompt)
-            return self._parse_action_plan(response)
+            return self._parse_action_plan_with_placeholders(response)
         except Exception as e:
-            logger.error(f"Action planning failed: {e}")
+            logger.error(f"Enhanced action planning failed: {e}")
             return ActionPlan(
                 goal=issue_description,
                 steps=[],
@@ -358,3 +383,115 @@ class ServerStateAnalyzer:
                 estimated_time="unknown",
                 safety_score=0.0
             )
+    
+    def _parse_action_plan_with_placeholders(self, response: str) -> ActionPlan:
+        """Parse LLM action plan response with placeholder support"""
+        try:
+            data = json.loads(response)
+            
+            # Process steps to ensure they have the required fields
+            processed_steps = []
+            for step in data.get("steps", []):
+                if isinstance(step, dict):
+                    # Ensure all required fields exist
+                    processed_step = {
+                        "command": step.get("command", ""),
+                        "description": step.get("description", ""),
+                        "prerequisite_check": step.get("prerequisite_check", ""),
+                        "safety_check": step.get("safety_check", ""),
+                        "auto_generate": step.get("auto_generate", []),
+                        "success_verification": step.get("success_verification", "")
+                    }
+                    processed_steps.append(processed_step)
+                else:
+                    # Convert string steps to dict format
+                    processed_steps.append({
+                        "command": str(step),
+                        "description": str(step),
+                        "prerequisite_check": "",
+                        "safety_check": "",
+                        "auto_generate": [],
+                        "success_verification": ""
+                    })
+            
+            return ActionPlan(
+                goal=data.get("goal", ""),
+                steps=processed_steps,
+                risks=data.get("risks", []),
+                estimated_time=data.get("estimated_time", "unknown"),
+                safety_score=float(data.get("safety_score", 0.0))
+            )
+        except Exception as e:
+            logger.error(f"Failed to parse enhanced action plan: {e}")
+            return ActionPlan(
+                goal="Failed to parse plan",
+                steps=[],
+                risks=[f"Parse error: {str(e)}"],
+                estimated_time="unknown",
+                safety_score=0.0
+            )
+    
+    def analyze_command_for_missing_info(self, command: str, error_output: str, 
+                                       system_context: Dict[str, Any]) -> Dict[str, Any]:
+        """Analyze a failed command to identify missing information and suggest fixes"""
+        if not self._client:
+            return {
+                "missing_info": [],
+                "corrected_command": command,
+                "auto_generate": [],
+                "confidence": 0.0
+            }
+        
+        prompt = f"""
+        Analyze this failed command to identify missing information and provide a corrected version:
+        
+        Failed Command: {command}
+        Error Output: {error_output}
+        
+        System Context:
+        {json.dumps(system_context, indent=2)[:1000]}
+        
+        ANALYSIS REQUIRED:
+        ==================
+        1. What information is missing from the command?
+        2. What placeholders should be used for auto-generation?
+        3. What is the corrected command with proper placeholders?
+        4. How confident are you in this analysis?
+        
+        PLACEHOLDER TYPES:
+        ==================
+        - <password> for secure passwords
+        - <random_string> for random alphanumeric strings  
+        - <timestamp> for current timestamp
+        - <temp_file> for temporary filenames
+        - <secure_key> for cryptographic keys
+        - <random_port> for available port numbers
+        
+        COMMON PATTERNS:
+        ================
+        - "passwd username" → "echo 'username:<password>' | chpasswd"
+        - "useradd user" → "useradd user && echo 'user:<password>' | chpasswd"
+        - "mysql -p" → "mysql -p<password>"
+        - "openssl genrsa" → "openssl genrsa -out key_<timestamp>.pem 2048"
+        
+        Respond in JSON format:
+        {{
+            "missing_info": ["list of missing information types"],
+            "corrected_command": "command with placeholders",
+            "auto_generate": ["list of placeholder types to generate"],
+            "explanation": "why the original command failed",
+            "confidence": 0.8
+        }}
+        """
+        
+        try:
+            response = self._call_llm(prompt)
+            return json.loads(response)
+        except Exception as e:
+            logger.error(f"Command analysis failed: {e}")
+            return {
+                "missing_info": [],
+                "corrected_command": command,
+                "auto_generate": [],
+                "confidence": 0.0
+            }
