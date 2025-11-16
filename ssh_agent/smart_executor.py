@@ -442,6 +442,117 @@ class SmartExecutor:
             logger.error(f"Failed to get recovery plan: {e}")
             return self._create_fallback_plan(original_task, failure_analysis)
     
+    def _validate_step_completion(self, step: Dict[str, Any], result: CommandResult, 
+                                original_goal: str) -> Dict[str, Any]:
+        """Validate if a step should be considered successful even if command failed"""
+        command = step.get("command", "") if isinstance(step, dict) else str(step)
+        description = step.get("description", "") if isinstance(step, dict) else ""
+        
+        # If command succeeded, no need for validation
+        if result.exit_code == 0:
+            return {"continue": True, "reason": "Command succeeded", "step_achieved": True}
+        
+        # Check for common "already exists" scenarios
+        already_exists_patterns = [
+            ("user.*already exists", "user creation"),
+            ("group.*already exists", "group creation"),
+            ("file exists", "file creation"),
+            ("directory.*exists", "directory creation"),
+            ("package.*already.*installed", "package installation"),
+            ("service.*already.*running", "service start"),
+            ("service.*already.*enabled", "service enable"),
+            ("already.*member", "group membership"),
+            ("nothing to do", "package operation"),
+            ("no change", "configuration change")
+        ]
+        
+        stderr_lower = result.stderr.lower()
+        stdout_lower = result.stdout.lower()
+        
+        for pattern, operation_type in already_exists_patterns:
+            if pattern in stderr_lower or pattern in stdout_lower:
+                logger.info(f"Step appears already completed: {operation_type}")
+                return {
+                    "continue": True, 
+                    "reason": f"Step already completed: {operation_type}",
+                    "step_achieved": True,
+                    "skip_reason": f"Target already exists: {pattern}"
+                }
+        
+        # For unclear failures, consult LLM
+        return self._consult_llm_for_step_validation(step, result, original_goal)
+
+    def _consult_llm_for_step_validation(self, step: Dict[str, Any], result: CommandResult, 
+                                       original_goal: str) -> Dict[str, Any]:
+        """Consult LLM to determine if step failure should stop execution"""
+        command = step.get("command", "") if isinstance(step, dict) else str(step)
+        description = step.get("description", "") if isinstance(step, dict) else ""
+        
+        prompt = f"""
+        A command in an execution plan has failed. Determine if this failure should stop the entire plan or if we can continue.
+        
+        Original Goal: {original_goal}
+        Failed Step: {description}
+        Failed Command: {command}
+        Exit Code: {result.exit_code}
+        Error Output: {result.stderr}
+        Standard Output: {result.stdout}
+        
+        Analyze this failure and determine:
+        1. Is the intended outcome of this step already achieved? (e.g., user already exists, package already installed)
+        2. Is this a benign failure that shouldn't stop the plan?
+        3. Is this a critical failure that requires stopping?
+        4. Can the remaining steps still be executed successfully?
+        
+        Common scenarios to consider:
+        - User/group already exists (usually safe to continue)
+        - Package already installed (safe to continue)
+        - Service already running (safe to continue)
+        - File already exists (depends on context)
+        - Permission denied (usually critical)
+        - Command not found (usually critical)
+        - Network/connectivity issues (usually critical)
+        
+        Respond in JSON format:
+        {{
+            "continue": true/false,
+            "reason": "explanation of decision",
+            "step_achieved": true/false,
+            "confidence": 0.8,
+            "alternative_verification": "command to verify if step goal was achieved"
+        }}
+        """
+        
+        try:
+            response = self.analyzer._call_llm(prompt)
+            validation_result = json.loads(response)
+            
+            # If LLM suggests an alternative verification, try it
+            alt_verification = validation_result.get("alternative_verification", "")
+            if alt_verification and validation_result.get("continue", False):
+                verify_result = self.executor.execute(alt_verification)
+                if verify_result.allowed and verify_result.exit_code == 0:
+                    validation_result["verification_passed"] = True
+                    validation_result["verification_output"] = verify_result.stdout
+                else:
+                    validation_result["verification_passed"] = False
+                    # If verification fails, be more conservative
+                    if validation_result.get("confidence", 0) < 0.8:
+                        validation_result["continue"] = False
+                        validation_result["reason"] += " (verification failed)"
+            
+            return validation_result
+            
+        except Exception as e:
+            logger.error(f"LLM step validation failed: {e}")
+            # Default to conservative approach - stop on failure
+            return {
+                "continue": False,
+                "reason": f"LLM validation failed: {str(e)}",
+                "step_achieved": False,
+                "confidence": 0.0
+            }
+    
     def _execute_recovery_plan(self, recovery_plan: ActionPlan, auto_approve: bool = False) -> TaskResult:
         """Execute the LLM-generated recovery plan"""
         logger.info(f"Executing recovery plan: {recovery_plan.goal}")
