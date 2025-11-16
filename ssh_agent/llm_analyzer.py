@@ -167,6 +167,12 @@ class ServerStateAnalyzer:
         - User creation with password: "useradd username && echo 'username:<password>' | chpasswd"
         - Service with random config: "echo 'config_value=<random_string>' > /etc/service.conf"
         - Backup with timestamp: "tar -czf backup_<timestamp>.tar.gz /data"
+        - Log file with timestamp: "command > /var/log/operation_<timestamp>.log"
+        - Temporary file: "echo 'data' > /tmp/<temp_file>"
+        
+        TIMESTAMP FORMAT:
+        - <timestamp> generates format: YYYYMMDD_HHMMSS (e.g., 20241116_143022)
+        - Use for: backup files, log files, temporary files, unique identifiers
         
         Create an action plan with:
         1. Goal description

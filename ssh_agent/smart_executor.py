@@ -1122,10 +1122,37 @@ class SmartExecutor:
                 if generated_values:
                     final_command = corrected_command
                     for item, value in generated_values.items():
+                        # Normalize item name for matching
+                        item_lower = item.lower().strip('<>{}')
+                        
                         # Replace various placeholder formats
-                        placeholders = [f"<{item}>", f"{{{item}}}", f"<{item.upper()}>", f"{{{item.upper()}}}"]
-                        for placeholder in placeholders:
-                            final_command = final_command.replace(placeholder, value)
+                        placeholder_formats = [
+                            f"<{item}>", f"{{{item}}}", 
+                            f"<{item.upper()}>", f"{{{item.upper()}}}",
+                            f"<{item.lower()}>", f"{{{item.lower()}}}",
+                            f"<{item_lower}>", f"{{{item_lower}}}",
+                            # Handle timestamp-specific formats
+                            "<timestamp>", "{timestamp}",
+                            "<TIMESTAMP>", "{TIMESTAMP}",
+                            "<time>", "{time}",
+                            "<date>", "{date}",
+                            "<datetime>", "{datetime}"
+                        ]
+                        
+                        for placeholder in placeholder_formats:
+                            if placeholder in final_command:
+                                final_command = final_command.replace(placeholder, value)
+                                logger.debug(f"Replaced {placeholder} with {value[:10]}...")
+                        
+                        # Also handle the case where the item name matches the placeholder content
+                        if item_lower in ["timestamp", "time", "date", "datetime"]:
+                            for ts_placeholder in ["<timestamp>", "{timestamp}", "<time>", "{time}", "<date>", "{date}"]:
+                                if ts_placeholder in final_command:
+                                    final_command = final_command.replace(ts_placeholder, value)
+                                    logger.debug(f"Replaced timestamp placeholder {ts_placeholder} with {value}")
+                    
+                    # Debug and fix any remaining issues
+                    final_command = self._debug_placeholder_replacement(corrected_command, final_command, generated_values)
                     
                     validation_result["generated_command"] = final_command
                     validation_result["generated_values"] = generated_values
@@ -1414,8 +1441,23 @@ class SmartExecutor:
         if "openssl" in command and "genrsa" in command:
             generation_needed.append("secure_key")
         
-        if "backup" in command.lower() and not any(char.isdigit() for char in command):
-            generation_needed.append("timestamp")
+        # Check for backup/archive commands that need timestamps
+        backup_indicators = ["backup", "tar", "zip", "archive", "dump"]
+        if any(indicator in command.lower() for indicator in backup_indicators):
+            # Check if command doesn't already have a timestamp-like pattern
+            import re
+            if not re.search(r'\d{4}[-_]\d{2}[-_]\d{2}', command):
+                generation_needed.append("timestamp")
+        
+        # Check for log file creation
+        if any(indicator in command.lower() for indicator in ["log", "output", "report"]):
+            import re
+            if not re.search(r'\d{4}[-_]\d{2}[-_]\d{2}', command):
+                generation_needed.append("timestamp")
+        
+        # Check for temporary file creation
+        if any(indicator in command.lower() for indicator in ["temp", "tmp", "/tmp/"]):
+            generation_needed.append("temp_file")
         
         return generation_needed
     
@@ -1425,35 +1467,75 @@ class SmartExecutor:
         import string
         from datetime import datetime
         
-        if info_type in ["password", "<password>", "{password}"]:
+        # Normalize the info_type to handle various formats
+        info_type_lower = info_type.lower().strip('<>{}')
+        
+        if info_type_lower in ["password", "secure_password"]:
             # Generate secure password
             alphabet = string.ascii_letters + string.digits + "!@#$%^&*"
             return ''.join(secrets.choice(alphabet) for _ in range(16))
         
-        elif info_type in ["random_string", "<random_string>", "{random_string}"]:
+        elif info_type_lower in ["random_string", "randomstring"]:
             # Generate random alphanumeric string
             return ''.join(secrets.choice(string.ascii_letters + string.digits) for _ in range(12))
         
-        elif info_type in ["timestamp", "<timestamp>", "{timestamp}"]:
-            # Generate timestamp
-            return datetime.now().strftime("%Y%m%d_%H%M%S")
+        elif info_type_lower in ["timestamp", "time", "date", "datetime"]:
+            # Generate timestamp in various formats
+            now = datetime.now()
+            return now.strftime("%Y%m%d_%H%M%S")
         
-        elif info_type in ["temp_file", "<temp_file>", "{temp_file}"]:
+        elif info_type_lower in ["temp_file", "tempfile", "temporary_file"]:
             # Generate temporary filename
             random_suffix = ''.join(secrets.choice(string.ascii_lowercase) for _ in range(8))
-            return f"tmp_{random_suffix}"
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            return f"tmp_{timestamp}_{random_suffix}"
         
-        elif info_type in ["secure_key", "<secure_key>", "{secure_key}"]:
+        elif info_type_lower in ["secure_key", "securekey", "key"]:
             # Generate secure key identifier
             return ''.join(secrets.choice(string.ascii_letters + string.digits) for _ in range(32))
         
-        elif info_type in ["random_port", "<random_port>", "{random_port}"]:
+        elif info_type_lower in ["random_port", "port"]:
             # Generate random port in safe range
             return str(secrets.randbelow(10000) + 50000)  # 50000-59999
         
+        elif info_type_lower in ["backup_name", "backup_file"]:
+            # Generate backup filename with timestamp
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            return f"backup_{timestamp}"
+        
+        elif info_type_lower in ["log_file", "logfile"]:
+            # Generate log filename with timestamp
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            return f"log_{timestamp}.log"
+        
         else:
-            # Default to random string
+            # Default to random string for unknown types
+            logger.warning(f"Unknown info type '{info_type}', generating random string")
             return ''.join(secrets.choice(string.ascii_letters + string.digits) for _ in range(12))
+    
+    def _debug_placeholder_replacement(self, original_command: str, final_command: str, generated_values: Dict[str, Any]) -> str:
+        """Debug placeholder replacement process"""
+        from datetime import datetime
+        
+        logger.debug(f"Placeholder replacement debug:")
+        logger.debug(f"  Original: {original_command}")
+        logger.debug(f"  Final: {final_command}")
+        logger.debug(f"  Generated values: {generated_values}")
+        
+        # Check for unreplaced placeholders
+        import re
+        remaining_placeholders = re.findall(r'<[^>]+>|\{[^}]+\}', final_command)
+        if remaining_placeholders:
+            logger.warning(f"Unreplaced placeholders found: {remaining_placeholders}")
+            
+            # Try to fix common timestamp issues
+            for placeholder in remaining_placeholders:
+                if any(ts_word in placeholder.lower() for ts_word in ['timestamp', 'time', 'date']):
+                    timestamp_value = datetime.now().strftime("%Y%m%d_%H%M%S")
+                    final_command = final_command.replace(placeholder, timestamp_value)
+                    logger.info(f"Fixed unreplaced timestamp placeholder: {placeholder} -> {timestamp_value}")
+        
+        return final_command
     
     def _detect_package_manager(self) -> Optional[str]:
         """Detect available package manager"""
