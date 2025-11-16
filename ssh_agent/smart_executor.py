@@ -1,3 +1,4 @@
+import json
 import logging
 from typing import List, Dict, Any, Optional
 from dataclasses import dataclass
@@ -60,23 +61,30 @@ class SmartExecutor:
         self.failure_contexts: List[FailureContext] = []
     
     def execute_task(self, task_description: str, auto_approve: bool = False) -> TaskResult:
-        """Break down complex tasks into commands using LLM with failure recovery"""
+        """Break down complex tasks into commands using LLM with recursive failure recovery"""
         logger.info(f"Starting smart task execution: {task_description}")
         
         # Reset failure contexts for new task
         self.failure_contexts = []
         recovery_attempts = 0
+        original_task = task_description
         
         # Initial execution attempt
         result = self._execute_task_attempt(task_description, auto_approve)
         
-        # If failed and we have recovery attempts left, try LLM-guided recovery
+        # Recursive recovery loop
         while not result.success and recovery_attempts < self.max_recovery_attempts:
             recovery_attempts += 1
             logger.info(f"Attempting failure recovery {recovery_attempts}/{self.max_recovery_attempts}")
             
+            # Analyze the specific failure
+            if result.results:
+                failed_command = result.results[-1]
+                failure_analysis = self._analyze_command_failure(failed_command, original_task)
+                logger.info(f"Failure analysis: {failure_analysis}")
+            
             # Get failure recovery plan from LLM
-            recovery_plan = self._get_failure_recovery_plan(result, task_description)
+            recovery_plan = self._get_failure_recovery_plan(result, original_task)
             
             if recovery_plan and recovery_plan.steps:
                 # Create failure context
@@ -85,7 +93,7 @@ class SmartExecutor:
                     failed_command=result.results[-1].command if result.results else "Unknown command",
                     attempt_number=recovery_attempts,
                     recovery_plan=recovery_plan,
-                    llm_analysis=f"Recovery attempt {recovery_attempts}"
+                    llm_analysis=f"Recovery attempt {recovery_attempts}: {failure_analysis.get('failure_type', 'unknown') if result.results else 'unknown'}"
                 )
                 self.failure_contexts.append(failure_context)
                 
@@ -95,9 +103,26 @@ class SmartExecutor:
                 # If recovery succeeded, retry original task
                 if recovery_result.success:
                     logger.info("Recovery successful, retrying original task")
-                    result = self._execute_task_attempt(task_description, auto_approve)
+                    result = self._execute_task_attempt(original_task, auto_approve)
                 else:
                     logger.warning(f"Recovery attempt {recovery_attempts} failed")
+                    
+                    # If this was a "command not found" that couldn't be fixed,
+                    # try to revise the original task to work without that command
+                    if (recovery_attempts == self.max_recovery_attempts and 
+                        result.results and
+                        self._analyze_command_failure(result.results[-1], original_task).get("failure_type") == "command_not_found"):
+                        
+                        logger.info("Attempting task revision to work without missing command")
+                        revised_task = self._revise_task_without_command(
+                            original_task, 
+                            result.results[-1].command.split()[0] if result.results else "unknown"
+                        )
+                        
+                        if revised_task != original_task:
+                            logger.info(f"Revised task: {revised_task}")
+                            result = self._execute_task_attempt(revised_task, auto_approve)
+                            break
             else:
                 logger.error("No recovery plan generated, stopping attempts")
                 break
@@ -206,50 +231,44 @@ class SmartExecutor:
         )
     
     def _get_failure_recovery_plan(self, failed_result: TaskResult, original_task: str) -> Optional[ActionPlan]:
-        """Get LLM-generated recovery plan for failed task"""
+        """Get LLM-generated recovery plan for failed task with specific failure analysis"""
         if not failed_result.results:
             return None
         
-        # Get the failed command and its output
+        # Get the failed command and analyze it
         failed_command_result = failed_result.results[-1]
+        failure_analysis = self._analyze_command_failure(failed_command_result, original_task)
+        
+        # Get current system state
         current_state = self.context.get_current_state()
         
-        prompt = f"""
-        A task execution failed and needs recovery. Analyze the failure and create a recovery plan.
-        
-        Original Task: {original_task}
-        
-        Failed Command: {failed_command_result.command}
-        Exit Code: {failed_command_result.exit_code}
-        Error Output: {failed_command_result.stderr}
-        
-        Previous Commands Executed:
-        {[r.command for r in failed_result.results[:-1]]}
-        
-        Current System State:
-        {self.context.get_context_summary()}
-        
-        Create a recovery plan that:
-        1. Diagnoses the root cause of the failure
-        2. Provides steps to fix the underlying issue
-        3. Ensures the original task can succeed after recovery
-        
-        Focus on common failure scenarios:
-        - Missing dependencies/packages
-        - Permission issues
-        - Service not running
-        - Configuration problems
-        - Network connectivity issues
-        
-        Respond in JSON format with the same structure as action plans.
-        """
+        # Create a comprehensive prompt based on failure type
+        if failure_analysis["failure_type"] == "command_not_found":
+            prompt = self._create_command_not_found_prompt(
+                original_task, failed_command_result, failure_analysis, current_state
+            )
+        elif failure_analysis["failure_type"] == "package_not_available":
+            prompt = self._create_package_not_available_prompt(
+                original_task, failed_command_result, failure_analysis, current_state
+            )
+        else:
+            prompt = self._create_generic_failure_prompt(
+                original_task, failed_command_result, failure_analysis, current_state
+            )
         
         try:
             response = self.analyzer._call_llm(prompt)
-            return self.analyzer._parse_action_plan(response)
+            recovery_plan = self.analyzer._parse_action_plan(response)
+            
+            # If recovery plan fails, create fallback plan
+            if not recovery_plan.steps:
+                return self._create_fallback_plan(original_task, failure_analysis)
+            
+            return recovery_plan
+            
         except Exception as e:
             logger.error(f"Failed to get recovery plan: {e}")
-            return None
+            return self._create_fallback_plan(original_task, failure_analysis)
     
     def _execute_recovery_plan(self, recovery_plan: ActionPlan, auto_approve: bool = False) -> TaskResult:
         """Execute the LLM-generated recovery plan"""
@@ -435,4 +454,255 @@ class SmartExecutor:
             if result.allowed and result.exit_code == 0:
                 return manager.replace("-get", "")  # Return "apt" instead of "apt-get"
         
+        return None
+    
+    def _analyze_command_failure(self, failed_result: CommandResult, original_task: str) -> Dict[str, Any]:
+        """Analyze specific command failure and determine recovery strategy"""
+        command = failed_result.command
+        stderr = failed_result.stderr
+        exit_code = failed_result.exit_code
+        
+        # Check for common failure patterns
+        failure_analysis = {
+            "failure_type": "unknown",
+            "missing_package": None,
+            "recovery_strategy": "retry",
+            "alternative_commands": []
+        }
+        
+        # Command not found
+        if "command not found" in stderr or "not found" in stderr or exit_code == 127:
+            failure_analysis["failure_type"] = "command_not_found"
+            # Extract the missing command
+            missing_cmd = command.split()[0]
+            failure_analysis["missing_package"] = self._guess_package_for_command(missing_cmd)
+            failure_analysis["recovery_strategy"] = "install_package"
+        
+        # Permission denied
+        elif "permission denied" in stderr.lower() or exit_code == 126:
+            failure_analysis["failure_type"] = "permission_denied"
+            failure_analysis["recovery_strategy"] = "add_sudo"
+        
+        # Package not available
+        elif "unable to locate package" in stderr.lower() or "no package" in stderr.lower():
+            failure_analysis["failure_type"] = "package_not_available"
+            failure_analysis["recovery_strategy"] = "find_alternative"
+        
+        # Service not found
+        elif "unit not found" in stderr.lower() or "service not found" in stderr.lower():
+            failure_analysis["failure_type"] = "service_not_found"
+            failure_analysis["recovery_strategy"] = "find_alternative_service"
+        
+        return failure_analysis
+
+    def _guess_package_for_command(self, command: str) -> Optional[str]:
+        """Guess the package name for a missing command"""
+        # Common command to package mappings
+        command_packages = {
+            "curl": "curl",
+            "wget": "wget", 
+            "git": "git",
+            "vim": "vim",
+            "nano": "nano",
+            "htop": "htop",
+            "tree": "tree",
+            "unzip": "unzip",
+            "zip": "zip",
+            "docker": "docker.io",
+            "nginx": "nginx",
+            "apache2": "apache2",
+            "mysql": "mysql-server",
+            "python3": "python3",
+            "pip": "python3-pip",
+            "node": "nodejs",
+            "npm": "npm",
+            "java": "default-jdk",
+            "gcc": "build-essential",
+            "make": "build-essential"
+        }
+        
+        return command_packages.get(command, command)
+
+    def _create_command_not_found_prompt(self, original_task: str, failed_result: CommandResult, 
+                                       failure_analysis: Dict[str, Any], current_state: Dict[str, Any]) -> str:
+        """Create specific prompt for command not found errors"""
+        missing_package = failure_analysis.get("missing_package", "unknown")
+        
+        return f"""
+        COMMAND NOT FOUND ERROR - Need Recovery Plan
+        
+        Original Task: {original_task}
+        Failed Command: {failed_result.command}
+        Error: {failed_result.stderr}
+        
+        Analysis: The command '{failed_result.command.split()[0]}' was not found.
+        Likely missing package: {missing_package}
+        
+        Current System State:
+        - Package Manager: {current_state.get('known_packages', {}).get('manager', 'unknown')}
+        - System Info: {json.dumps(current_state.get('current_state', {}), indent=2)[:500]}
+        
+        Create a recovery plan that:
+        1. First tries to install the missing package ({missing_package})
+        2. If installation fails, finds alternative commands/packages
+        3. If no alternatives work, revises the original task to work without this tool
+        4. Includes verification steps to ensure each step works
+        
+        IMPORTANT: 
+        - Include package installation commands (apt install, yum install, etc.)
+        - Include alternative approaches if the package doesn't exist
+        - Include a fallback plan that accomplishes the original goal differently
+        
+        Example recovery steps:
+        1. Update package lists: "apt update" or "yum update"
+        2. Install package: "apt install -y {missing_package}" or "yum install -y {missing_package}"
+        3. Verify installation: "which {failed_result.command.split()[0]}"
+        4. If still fails, try alternative: [suggest alternative commands]
+        5. If no alternatives, modify approach: [suggest different way to achieve goal]
+        
+        Respond in JSON format with detailed steps.
+        """
+
+    def _create_package_not_available_prompt(self, original_task: str, failed_result: CommandResult,
+                                           failure_analysis: Dict[str, Any], current_state: Dict[str, Any]) -> str:
+        """Create prompt for package not available errors"""
+        return f"""
+        PACKAGE NOT AVAILABLE ERROR - Need Alternative Approach
+        
+        Original Task: {original_task}
+        Failed Command: {failed_result.command}
+        Error: {failed_result.stderr}
+        
+        Analysis: The requested package is not available in the current repositories.
+        
+        Current System State:
+        {json.dumps(current_state, indent=2)[:1000]}
+        
+        Create a recovery plan that:
+        1. Tries alternative package names or repositories
+        2. Uses different tools to achieve the same goal
+        3. Modifies the original approach to work without this specific package
+        
+        Focus on:
+        - Alternative package names (e.g., docker vs docker.io vs docker-ce)
+        - Different tools that provide similar functionality
+        - Built-in system tools that can accomplish the same task
+        - Manual installation methods if appropriate
+        
+        CRITICAL: If no package alternatives work, completely revise the approach to the original task.
+        
+        Respond in JSON format with a comprehensive alternative plan.
+        """
+
+    def _create_generic_failure_prompt(self, original_task: str, failed_result: CommandResult,
+                                     failure_analysis: Dict[str, Any], current_state: Dict[str, Any]) -> str:
+        """Create prompt for other types of failures"""
+        return f"""
+        COMMAND EXECUTION FAILED - Need Recovery Plan
+        
+        Original Task: {original_task}
+        Failed Command: {failed_result.command}
+        Exit Code: {failed_result.exit_code}
+        Error: {failed_result.stderr}
+        Failure Type: {failure_analysis['failure_type']}
+        
+        Current System State:
+        {json.dumps(current_state, indent=2)[:1000]}
+        
+        Analyze the failure and create a recovery plan that:
+        1. Addresses the specific cause of failure
+        2. Includes prerequisite checks and fixes
+        3. Provides alternative approaches if the direct fix doesn't work
+        4. Ensures the original goal can still be achieved
+        
+        Consider common issues:
+        - Permission problems (add sudo, change ownership)
+        - Missing dependencies (install required packages)
+        - Service issues (start/restart services)
+        - Configuration problems (fix config files)
+        - Network issues (check connectivity, DNS)
+        
+        Respond in JSON format with a detailed recovery plan.
+        """
+
+    def _create_fallback_plan(self, original_task: str, failure_analysis: Dict[str, Any]) -> ActionPlan:
+        """Create a basic fallback plan when LLM consultation fails"""
+        fallback_steps = []
+        
+        if failure_analysis["failure_type"] == "command_not_found":
+            missing_package = failure_analysis.get("missing_package", "unknown")
+            fallback_steps = [
+                {
+                    "command": "apt update || yum update || true",
+                    "description": "Update package lists"
+                },
+                {
+                    "command": f"apt install -y {missing_package} || yum install -y {missing_package} || echo 'Package installation failed'",
+                    "description": f"Try to install {missing_package}"
+                },
+                {
+                    "command": f"which {missing_package} || echo 'Command still not available, need alternative approach'",
+                    "description": "Verify installation"
+                }
+            ]
+        else:
+            fallback_steps = [
+                {
+                    "command": "echo 'Attempting basic recovery'",
+                    "description": "Basic fallback attempt"
+                }
+            ]
+        
+        return ActionPlan(
+            goal=f"Fallback recovery for: {original_task}",
+            steps=fallback_steps,
+            risks=["Fallback plan - limited recovery capability"],
+            estimated_time="2-5 minutes",
+            safety_score=0.7
+        )
+
+    def _revise_task_without_command(self, original_task: str, missing_command: str) -> str:
+        """Use LLM to revise the task to work without a specific command"""
+        prompt = f"""
+        The original task cannot be completed because the command '{missing_command}' is not available and cannot be installed.
+        
+        Original Task: {original_task}
+        Missing Command: {missing_command}
+        
+        Revise the task to accomplish the same goal using:
+        1. Built-in system commands only
+        2. Alternative approaches that don't require {missing_command}
+        3. Different tools that are commonly available
+        
+        Provide a revised task description that achieves the same end goal.
+        Respond with just the revised task description, no explanation.
+        """
+        
+        try:
+            revised_task = self.analyzer._call_llm(prompt).strip()
+            return revised_task if revised_task else original_task
+        except Exception as e:
+            logger.error(f"Task revision failed: {e}")
+            return original_task
+
+    def _detect_and_update_package_manager(self):
+        """Detect package manager and update system state"""
+        pkg_managers = [
+            ("apt-get", "apt"),
+            ("yum", "yum"), 
+            ("dnf", "dnf"),
+            ("pacman", "pacman"),
+            ("zypper", "zypper")
+        ]
+        
+        for cmd, manager in pkg_managers:
+            result = self.executor.execute(f"which {cmd}")
+            if result.allowed and result.exit_code == 0:
+                # Update context with package manager info
+                current_state = self.context.get_current_state()
+                current_state["package_manager"] = manager
+                logger.info(f"Detected package manager: {manager}")
+                return manager
+        
+        logger.warning("No supported package manager detected")
         return None
