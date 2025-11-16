@@ -1,8 +1,11 @@
 import json
 import logging
+import os
+import hashlib
 from typing import List, Dict, Any, Optional
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
+from pathlib import Path
 from .executor import CommandExecutor, CommandResult
 from .llm_analyzer import ServerStateAnalyzer, ActionPlan
 from .context_manager import ServerContext
@@ -60,9 +63,111 @@ class SmartExecutor:
         self.context = context
         self.max_recovery_attempts = 2
         self.failure_contexts: List[FailureContext] = []
+        
+        # Environment caching settings
+        self.cache_ttl_minutes = 30  # Cache valid for 30 minutes
+        self.cache_dir = Path.home() / ".ssh_agent_cache"
+        self.cache_dir.mkdir(exist_ok=True)
+        self._environment_cache = None
+        self._cache_timestamp = None
+    
+    def _get_cached_environment_info(self) -> Optional[Dict[str, Any]]:
+        """Get cached environment info if still valid"""
+        if self._environment_cache and self._cache_timestamp:
+            age = datetime.now() - self._cache_timestamp
+            if age < timedelta(minutes=self.cache_ttl_minutes):
+                logger.debug("Using cached environment info")
+                return self._environment_cache
+        
+        # Try to load from disk cache
+        cached_data = self._load_environment_cache()
+        if cached_data:
+            self._environment_cache = cached_data
+            self._cache_timestamp = datetime.now()
+            logger.debug("Loaded environment info from disk cache")
+            return cached_data
+        
+        return None
+    
+    def _save_environment_cache(self, env_info: Dict[str, Any]):
+        """Save environment info to cache"""
+        try:
+            # Create cache key based on connection details
+            connection_key = f"{self.executor.connection.hostname}_{self.executor.connection.username}_{self.executor.connection.port}"
+            cache_file = self.cache_dir / f"env_{hashlib.md5(connection_key.encode()).hexdigest()}.json"
+            
+            cache_data = {
+                "timestamp": datetime.now().isoformat(),
+                "connection_key": connection_key,
+                "environment_info": env_info
+            }
+            
+            with open(cache_file, 'w') as f:
+                json.dump(cache_data, f, indent=2)
+            
+            # Update memory cache
+            self._environment_cache = env_info
+            self._cache_timestamp = datetime.now()
+            
+            logger.debug(f"Saved environment cache to {cache_file}")
+            
+        except Exception as e:
+            logger.warning(f"Failed to save environment cache: {e}")
+    
+    def _load_environment_cache(self) -> Optional[Dict[str, Any]]:
+        """Load environment info from disk cache if valid"""
+        try:
+            connection_key = f"{self.executor.connection.hostname}_{self.executor.connection.username}_{self.executor.connection.port}"
+            cache_file = self.cache_dir / f"env_{hashlib.md5(connection_key.encode()).hexdigest()}.json"
+            
+            if not cache_file.exists():
+                return None
+            
+            with open(cache_file, 'r') as f:
+                cache_data = json.load(f)
+            
+            # Check if cache is still valid
+            cache_time = datetime.fromisoformat(cache_data["timestamp"])
+            age = datetime.now() - cache_time
+            
+            if age < timedelta(minutes=self.cache_ttl_minutes):
+                # Verify connection key matches
+                if cache_data.get("connection_key") == connection_key:
+                    return cache_data["environment_info"]
+            
+            # Cache expired or invalid, remove it
+            cache_file.unlink()
+            return None
+            
+        except Exception as e:
+            logger.warning(f"Failed to load environment cache: {e}")
+            return None
+    
+    def _invalidate_environment_cache(self):
+        """Invalidate the current environment cache"""
+        self._environment_cache = None
+        self._cache_timestamp = None
+        
+        try:
+            connection_key = f"{self.executor.connection.hostname}_{self.executor.connection.username}_{self.executor.connection.port}"
+            cache_file = self.cache_dir / f"env_{hashlib.md5(connection_key.encode()).hexdigest()}.json"
+            
+            if cache_file.exists():
+                cache_file.unlink()
+                logger.debug("Invalidated environment cache")
+                
+        except Exception as e:
+            logger.warning(f"Failed to invalidate environment cache: {e}")
     
     def _collect_comprehensive_environment_info(self) -> Dict[str, Any]:
-        """Collect comprehensive Linux environment information for LLM planning"""
+        """Collect comprehensive Linux environment information for LLM planning with caching"""
+        # Try to get cached info first
+        cached_info = self._get_cached_environment_info()
+        if cached_info:
+            return cached_info
+        
+        logger.info("Collecting fresh environment information...")
+        
         env_info = {
             "distribution": {},
             "package_manager": {},
@@ -190,6 +295,9 @@ class SmartExecutor:
             if result.allowed and result.exit_code == 0:
                 env_info["filesystem_info"][key] = result.stdout.strip()
         
+        # Save to cache for future use
+        self._save_environment_cache(env_info)
+        
         return env_info
     
     def execute_task(self, task_description: str, auto_approve: bool = False) -> TaskResult:
@@ -200,6 +308,11 @@ class SmartExecutor:
         self.failure_contexts = []
         recovery_attempts = 0
         original_task = task_description
+        
+        # Check if we should invalidate cache for system-changing tasks
+        if self._should_invalidate_cache(task_description):
+            logger.info("Task may change system state, invalidating environment cache")
+            self._invalidate_environment_cache()
         
         # Initial execution attempt
         result = self._execute_task_attempt(task_description, auto_approve)
@@ -444,6 +557,19 @@ class SmartExecutor:
             # If recovery plan fails, create fallback plan
             if not recovery_plan.steps:
                 return self._create_fallback_plan(original_task, failure_analysis)
+    
+            def _should_invalidate_cache(self, task_description: str) -> bool:
+                """Determine if a task might change system state and require cache invalidation"""
+                system_changing_keywords = [
+                    "install", "remove", "uninstall", "update", "upgrade",
+                    "configure", "setup", "create user", "delete user",
+                    "start service", "stop service", "restart service",
+                    "enable service", "disable service", "mount", "unmount",
+                    "partition", "format", "network", "firewall", "iptables"
+                ]
+        
+                task_lower = task_description.lower()
+                return any(keyword in task_lower for keyword in system_changing_keywords)
             
             return recovery_plan
             
