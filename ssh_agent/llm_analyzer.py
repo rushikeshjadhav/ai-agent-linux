@@ -263,6 +263,56 @@ class ServerStateAnalyzer:
                 confidence=0.0
             )
     
+    def analyze_command_failure(self, command: str, exit_code: int, stderr: str, 
+                               system_state: Dict[str, Any]) -> Dict[str, Any]:
+        """Analyze why a specific command failed and suggest fixes"""
+        if not self._client:
+            return {
+                "diagnosis": "LLM analysis unavailable",
+                "likely_causes": [],
+                "suggested_fixes": [],
+                "confidence": 0.0
+            }
+        
+        prompt = f"""
+        Analyze this failed Linux command and provide diagnostic information:
+        
+        Command: {command}
+        Exit Code: {exit_code}
+        Error Output: {stderr}
+        
+        System Context:
+        {json.dumps(system_state, indent=2)}
+        
+        Provide:
+        1. Diagnosis of what went wrong
+        2. Most likely causes (in order of probability)
+        3. Specific commands/steps to fix the issue
+        4. Confidence level in this analysis (0.0-1.0)
+        
+        Focus on common failure patterns:
+        - Package/dependency missing
+        - Permission denied
+        - Service not running
+        - File/directory not found
+        - Network/connectivity issues
+        - Configuration errors
+        
+        Respond in JSON format.
+        """
+        
+        try:
+            response = self._call_llm(prompt)
+            return json.loads(response)
+        except Exception as e:
+            logger.error(f"Command failure analysis failed: {e}")
+            return {
+                "diagnosis": f"Analysis failed: {str(e)}",
+                "likely_causes": [],
+                "suggested_fixes": [],
+                "confidence": 0.0
+            }
+    
     def _parse_action_plan(self, response: str) -> ActionPlan:
         """Parse LLM action plan response"""
         try:
