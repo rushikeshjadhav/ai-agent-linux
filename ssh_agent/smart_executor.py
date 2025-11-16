@@ -371,8 +371,17 @@ class SmartExecutor:
                             "skip_reason": validation.get("skip_reason", "")
                         })
                     
-                    # Add validation info to result for tracking
-                    result.validation_info = validation
+                    # Create new result with validation info
+                    result = CommandResult(
+                        stdout=result.stdout,
+                        stderr=result.stderr,
+                        exit_code=result.exit_code,
+                        command=result.command,
+                        allowed=result.allowed,
+                        reason=result.reason,
+                        validation_info=validation
+                    )
+                    results[-1] = result  # Replace the last result with the updated one
                     continue
                 else:
                     logger.error(f"Critical failure at step {i+1}: {validation.get('reason', 'Unknown')}")

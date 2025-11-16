@@ -1,5 +1,5 @@
 import logging
-from typing import NamedTuple, Optional
+from typing import NamedTuple, Optional, Dict
 from .connection import SSHConnection
 from .modes import AgentMode, CommandValidator
 
@@ -13,6 +13,7 @@ class CommandResult(NamedTuple):
     command: str
     allowed: bool
     reason: str
+    validation_info: Optional[Dict] = None
 
 class CommandExecutor:
     """Executes commands on remote hosts with mode-based restrictions"""
@@ -36,7 +37,8 @@ class CommandExecutor:
                 exit_code=-1,
                 command=command,
                 allowed=False,
-                reason=reason
+                reason=reason,
+                validation_info=None
             )
         
         # Check connection
@@ -47,7 +49,8 @@ class CommandExecutor:
                 exit_code=-1,
                 command=command,
                 allowed=True,
-                reason="Connection error"
+                reason="Connection error",
+                validation_info=None
             )
         
         try:
@@ -69,7 +72,8 @@ class CommandExecutor:
                 exit_code=exit_code,
                 command=command,
                 allowed=True,
-                reason="Command executed successfully"
+                reason="Command executed successfully",
+                validation_info=None
             )
             
         except Exception as e:
@@ -80,7 +84,8 @@ class CommandExecutor:
                 exit_code=-1,
                 command=command,
                 allowed=True,
-                reason=f"Execution error: {str(e)}"
+                reason=f"Execution error: {str(e)}",
+                validation_info=None
             )
     
     def execute_with_context(self, command: str, context: dict = None, timeout: int = 30) -> CommandResult:
