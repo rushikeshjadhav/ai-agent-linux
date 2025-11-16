@@ -234,6 +234,167 @@ class SmartExecutor:
         except Exception as e:
             logger.warning(f"Failed to invalidate environment cache: {e}")
     
+    def _collect_task_prerequisites(self, task_description: str, env_info: Dict[str, Any]) -> Dict[str, Any]:
+        """Phase 1: Ask LLM what prerequisites need to be collected for this task"""
+        if not self.analyzer._client:
+            return {"prerequisites": [], "error": "LLM unavailable"}
+        
+        prompt = f"""
+        Analyze this task and determine what prerequisite information needs to be collected before creating an execution plan:
+        
+        Task: {task_description}
+        
+        Current Environment:
+        {json.dumps(env_info, indent=2)[:1500]}
+        
+        PREREQUISITE CATEGORIES:
+        1. Service Status - which services need to be checked
+        2. Package Status - which packages need verification
+        3. File/Directory Existence - what paths need checking
+        4. Network Connectivity - what endpoints need testing
+        5. User/Permission Context - what access levels need verification
+        6. Configuration State - what config files need reading
+        7. Resource Availability - what system resources need checking
+        8. Dependency Verification - what dependencies need validation
+        
+        For each prerequisite, specify:
+        - category: one of the above categories
+        - check_command: exact command to run
+        - description: what this check determines
+        - required: true if task cannot proceed without this info
+        - fallback_command: alternative command if primary fails
+        
+        CRITICAL: Only request prerequisites that are actually needed for this specific task.
+        
+        Respond in JSON format:
+        {{
+            "prerequisites": [
+                {{
+                    "category": "service_status",
+                    "check_command": "systemctl status nginx",
+                    "description": "Check if nginx is running",
+                    "required": true,
+                    "fallback_command": "service nginx status"
+                }}
+            ],
+            "reasoning": "why these prerequisites are needed"
+        }}
+        """
+        
+        try:
+            response = self.analyzer._call_llm(prompt)
+            return json.loads(response)
+        except Exception as e:
+            logger.error(f"Failed to get task prerequisites: {e}")
+            return {"prerequisites": [], "error": str(e)}
+
+    def _execute_prerequisite_collection(self, prerequisites: List[Dict[str, Any]]) -> Dict[str, Any]:
+        """Phase 2: Execute prerequisite checks and collect results"""
+        prerequisite_results = {}
+        
+        for prereq in prerequisites:
+            category = prereq.get("category", "unknown")
+            command = prereq.get("check_command", "")
+            fallback = prereq.get("fallback_command", "")
+            description = prereq.get("description", "")
+            required = prereq.get("required", False)
+            
+            if not command:
+                continue
+            
+            logger.info(f"Collecting prerequisite: {description}")
+            
+            # Try primary command
+            result = self.executor.execute(command)
+            
+            # If primary fails and we have fallback, try it
+            if result.exit_code != 0 and fallback:
+                logger.debug(f"Primary command failed, trying fallback: {fallback}")
+                result = self.executor.execute(fallback)
+            
+            # Store result with metadata
+            prerequisite_results[category] = {
+                "command": command,
+                "description": description,
+                "required": required,
+                "success": result.exit_code == 0,
+                "stdout": result.stdout,
+                "stderr": result.stderr,
+                "exit_code": result.exit_code
+            }
+            
+            # If this was required and failed, note the failure
+            if required and result.exit_code != 0:
+                prerequisite_results[category]["failure_impact"] = "Task may not be possible without this information"
+        
+        return prerequisite_results
+
+    def _create_informed_action_plan(self, task_description: str, env_info: Dict[str, Any], 
+                                    prerequisite_results: Dict[str, Any]) -> ActionPlan:
+        """Phase 3: Create action plan with full prerequisite context"""
+        if not self.analyzer._client:
+            return ActionPlan(
+                goal=task_description,
+                steps=[],
+                risks=["LLM unavailable"],
+                estimated_time="unknown",
+                safety_score=0.0
+            )
+        
+        prompt = f"""
+        Create a comprehensive action plan with full prerequisite knowledge:
+        
+        TASK: {task_description}
+        
+        ENVIRONMENT CONTEXT:
+        {json.dumps(env_info, indent=2)[:1000]}
+        
+        PREREQUISITE RESULTS:
+        {json.dumps(prerequisite_results, indent=2)}
+        
+        PLANNING INSTRUCTIONS:
+        1. Use the prerequisite results to make informed decisions
+        2. Skip steps that are already completed (based on prerequisite checks)
+        3. Handle failed prerequisites appropriately
+        4. Use placeholders for values that need generation
+        5. Create conditional steps based on prerequisite outcomes
+        
+        PREREQUISITE-AWARE PLANNING:
+        - If service is already running → skip start commands
+        - If package is already installed → skip installation
+        - If file exists → skip creation or modify approach
+        - If user exists → skip user creation
+        - If configuration is correct → skip config changes
+        
+        PLACEHOLDER SYSTEM:
+        - <password> for secure passwords
+        - <timestamp> for current timestamp  
+        - <temp_file> for temporary files
+        - <random_string> for random values
+        
+        Each step should include:
+        - command: exact command with placeholders
+        - description: what this accomplishes
+        - prerequisite_basis: which prerequisite informed this step
+        - skip_condition: when this step can be skipped
+        - auto_generate: list of placeholders to generate
+        
+        Respond in JSON format with a complete action plan.
+        """
+        
+        try:
+            response = self.analyzer._call_llm(prompt)
+            return self.analyzer._parse_action_plan_with_placeholders(response)
+        except Exception as e:
+            logger.error(f"Failed to create informed action plan: {e}")
+            return ActionPlan(
+                goal=task_description,
+                steps=[],
+                risks=[f"Planning failed: {str(e)}"],
+                estimated_time="unknown",
+                safety_score=0.0
+            )
+
     def _collect_comprehensive_environment_info(self) -> Dict[str, Any]:
         """Collect comprehensive Linux environment information for LLM planning with caching"""
         # Try to get cached info first
@@ -755,22 +916,85 @@ class SmartExecutor:
         return result
     
     def _execute_task_attempt(self, task_description: str, auto_approve: bool = False) -> TaskResult:
-        """Execute a single task attempt with comprehensive environment info"""
-        # Collect comprehensive environment information
-        logger.info("Collecting comprehensive environment information...")
+        """Execute a single task attempt with prerequisite-informed planning"""
+        logger.info("=== PHASE 1: Environment Collection ===")
         env_info = self._collect_comprehensive_environment_info()
         
+        logger.info("=== PHASE 2: Prerequisite Analysis ===")
+        prerequisite_spec = self._collect_task_prerequisites(task_description, env_info)
+        
+        if prerequisite_spec.get("error"):
+            logger.warning(f"Prerequisite analysis failed: {prerequisite_spec['error']}")
+            # Fall back to original method
+            return self._execute_task_attempt_original(task_description, auto_approve)
+        
+        prerequisites = prerequisite_spec.get("prerequisites", [])
+        logger.info(f"LLM identified {len(prerequisites)} prerequisites to collect")
+        
+        logger.info("=== PHASE 3: Prerequisite Collection ===")
+        prerequisite_results = self._execute_prerequisite_collection(prerequisites)
+        
+        # Log what we learned
+        for category, result in prerequisite_results.items():
+            status = "✅" if result["success"] else "❌"
+            logger.info(f"{status} {category}: {result['description']}")
+        
+        logger.info("=== PHASE 4: Informed Action Planning ===")
+        action_plan = self._create_informed_action_plan(task_description, env_info, prerequisite_results)
+        
+        if not action_plan.steps:
+            return TaskResult(
+                task_description=task_description,
+                success=False,
+                steps_completed=0,
+                total_steps=0,
+                results=[],
+                error_message="No action plan generated with prerequisite context"
+            )
+        
+        logger.info(f"Generated plan with {len(action_plan.steps)} steps based on prerequisites")
+        
+        # Continue with existing execution logic...
+        current_state = self.context.get_current_state()
+        comprehensive_state = {
+            "environment": env_info,
+            "current_state": current_state,
+            "prerequisites": prerequisite_results,
+            "task_description": task_description
+        }
+        
+        # Validate action plan safety
+        commands = [step.get("command", "") for step in action_plan.steps]
+        validation = self.analyzer.validate_action_plan(commands, comprehensive_state)
+        
+        if not validation.get("safe", False) and not auto_approve:
+            return TaskResult(
+                task_description=task_description,
+                success=False,
+                steps_completed=0,
+                total_steps=len(action_plan.steps),
+                results=[],
+                error_message=f"Action plan not safe: {validation.get('reason', 'Unknown reason')}"
+            )
+        
+        # Execute steps with prerequisite awareness
+        return self._execute_steps_with_prerequisite_context(
+            action_plan, task_description, prerequisite_results
+        )
+
+    def _execute_task_attempt_original(self, task_description: str, auto_approve: bool = False) -> TaskResult:
+        """Original execution method as fallback"""
         # Get current system state
         current_state = self.context.get_current_state()
         
         # Combine environment info with current state
         comprehensive_state = {
-            "environment": env_info,
+            "environment": {},
             "current_state": current_state,
             "task_description": task_description
         }
         
-        # Get LLM action plan with full environment context
+        # Get LLM action plan with basic context
         action_plan = self.analyzer.suggest_actions(task_description, comprehensive_state)
         
         if not action_plan.steps:
@@ -791,7 +1015,7 @@ class SmartExecutor:
             else:
                 commands.append(str(step))
         
-        # Validate action plan safety with environment context
+        # Validate action plan safety
         validation = self.analyzer.validate_action_plan(commands, comprehensive_state)
         
         if not validation.get("safe", False) and not auto_approve:
@@ -804,7 +1028,7 @@ class SmartExecutor:
                 error_message=f"Action plan not safe: {validation.get('reason', 'Unknown reason')}"
             )
         
-        # Execute steps
+        # Execute steps with original logic
         results = []
         completed_steps = 0
         skipped_steps = []
@@ -1567,6 +1791,136 @@ class SmartExecutor:
         
         return final_command
     
+    def _execute_steps_with_prerequisite_context(self, action_plan: ActionPlan, 
+                                               task_description: str, 
+                                               prerequisite_results: Dict[str, Any]) -> TaskResult:
+        """Execute steps with awareness of prerequisite results"""
+        results = []
+        completed_steps = 0
+        skipped_steps = []
+        
+        for i, step in enumerate(action_plan.steps):
+            command = step.get("command", "")
+            description = step.get("description", "")
+            skip_condition = step.get("skip_condition", "")
+            prerequisite_basis = step.get("prerequisite_basis", "")
+            
+            logger.info(f"Step {i+1}/{len(action_plan.steps)}: {description}")
+            
+            # Check if step should be skipped based on prerequisites
+            if self._should_skip_step_based_on_prerequisites(step, prerequisite_results):
+                logger.info(f"Skipping step {i+1}: {skip_condition}")
+                skipped_steps.append({
+                    "step": i+1,
+                    "description": description,
+                    "reason": f"Prerequisite check: {prerequisite_basis}",
+                    "skip_reason": skip_condition
+                })
+                completed_steps += 1
+                continue
+            
+            if not command:
+                logger.warning(f"Step {i+1} has no command, skipping")
+                continue
+            
+            # Execute with existing logic but enhanced context
+            result = self.executor.execute(command)
+            results.append(result)
+            self.context.update_context(command, result)
+            
+            # Continue with existing validation logic...
+            if not result.allowed:
+                return TaskResult(
+                    task_description=task_description,
+                    success=False,
+                    steps_completed=completed_steps,
+                    total_steps=len(action_plan.steps),
+                    results=results,
+                    error_message=f"Command blocked: {result.reason}",
+                    skipped_steps=skipped_steps
+                )
+            
+            # Handle exit codes and validation as before...
+            if result.exit_code != 0:
+                exit_interpretation = self._interpret_exit_code(
+                    result.command, result.exit_code, result.stdout, result.stderr
+                )
+                
+                if not exit_interpretation["is_error"]:
+                    completed_steps += 1
+                    result = CommandResult(
+                        stdout=result.stdout,
+                        stderr=result.stderr,
+                        exit_code=result.exit_code,
+                        command=result.command,
+                        allowed=result.allowed,
+                        reason=result.reason,
+                        validation_info={
+                            "exit_interpretation": exit_interpretation,
+                            "treated_as_success": True,
+                            "prerequisite_context": prerequisite_basis
+                        }
+                    )
+                    results[-1] = result
+                    continue
+                
+                # Existing validation logic with prerequisite context...
+                validation = self._validate_step_completion(step, result, task_description)
+                
+                if validation.get("continue", False):
+                    # Enhanced with prerequisite context
+                    validation["prerequisite_context"] = prerequisite_basis
+                    completed_steps += 1
+                    continue
+                else:
+                    return TaskResult(
+                        task_description=task_description,
+                        success=False,
+                        steps_completed=completed_steps,
+                        total_steps=len(action_plan.steps),
+                        results=results,
+                        error_message=f"Critical failure: {validation.get('reason', result.stderr)}",
+                        skipped_steps=skipped_steps
+                    )
+            else:
+                completed_steps += 1
+        
+        return TaskResult(
+            task_description=task_description,
+            success=True,
+            steps_completed=completed_steps,
+            total_steps=len(action_plan.steps),
+            results=results,
+            skipped_steps=skipped_steps
+        )
+
+    def _should_skip_step_based_on_prerequisites(self, step: Dict[str, Any], 
+                                               prerequisite_results: Dict[str, Any]) -> bool:
+        """Determine if step should be skipped based on prerequisite results"""
+        prerequisite_basis = step.get("prerequisite_basis", "")
+        skip_condition = step.get("skip_condition", "")
+        
+        if not prerequisite_basis or not skip_condition:
+            return False
+        
+        # Check if the prerequisite result indicates this step should be skipped
+        prereq_result = prerequisite_results.get(prerequisite_basis, {})
+        
+        # Common skip patterns
+        if "already running" in skip_condition and "active (running)" in prereq_result.get("stdout", ""):
+            return True
+        
+        if "already installed" in skip_condition and prereq_result.get("success", False):
+            return True
+        
+        if "file exists" in skip_condition and prereq_result.get("success", False):
+            return True
+        
+        if "user exists" in skip_condition and prereq_result.get("success", False):
+            return True
+        
+        return False
+
     def _detect_package_manager(self) -> Optional[str]:
         """Detect available package manager"""
         managers = ["apt-get", "yum", "dnf", "pacman"]
