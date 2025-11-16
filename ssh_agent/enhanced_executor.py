@@ -40,6 +40,7 @@ class ExecutionAttempt:
     success: bool
     error_message: Optional[str]
     llm_feedback: Optional[str]
+    skipped_steps: List[Dict[str, Any]] = None
 
 @dataclass
 class EnhancedTaskResult:
@@ -347,43 +348,104 @@ class EnhancedExecutor:
             )
 
     def _execute_attempt(self, attempt_num: int, plan: ActionPlan, auto_approve: bool) -> ExecutionAttempt:
-        """Execute a single attempt"""
+        """Execute a single attempt with intelligent validation"""
+        return self._execute_with_intelligent_validation(plan, auto_approve)
+    
+    def _execute_with_intelligent_validation(self, plan: ActionPlan, auto_approve: bool) -> ExecutionAttempt:
+        """Execute plan with intelligent step validation"""
         timestamp = datetime.now().isoformat()
         results = []
+        skipped_steps = []
         
-        for step in plan.steps:
+        for i, step in enumerate(plan.steps):
             command = step.get("command", "") if isinstance(step, dict) else str(step)
+            description = step.get("description", "") if isinstance(step, dict) else ""
             
             if not command:
                 continue
-                
-            # Execute safety check first if provided
+            
+            # Execute prerequisite check if provided
+            prereq_check = step.get("prerequisite_check", "") if isinstance(step, dict) else ""
+            if prereq_check:
+                prereq_result = self.executor.execute(prereq_check)
+                if not prereq_result.allowed or prereq_result.exit_code != 0:
+                    logger.warning(f"Prerequisite check failed: {prereq_check}")
+                    # Check if prerequisite is actually already met
+                    prereq_validation = self._validate_prerequisite_failure(prereq_check, prereq_result, command)
+                    if not prereq_validation.get("continue", False):
+                        return ExecutionAttempt(
+                            attempt_number=1,
+                            timestamp=timestamp,
+                            plan=plan,
+                            results=results,
+                            success=False,
+                            error_message=f"Prerequisite failed: {prereq_check}",
+                            llm_feedback="Prerequisite validation failed"
+                        )
+            
+            # Execute safety check if provided
             safety_check = step.get("safety_check", "") if isinstance(step, dict) else ""
             if safety_check:
                 safety_result = self.executor.execute(safety_check)
                 if not safety_result.allowed or safety_result.exit_code != 0:
-                    logger.warning(f"Safety check failed for: {command}")
+                    logger.warning(f"Safety check failed: {safety_check}")
                     if not auto_approve:
-                        break
+                        return ExecutionAttempt(
+                            attempt_number=1,
+                            timestamp=timestamp,
+                            plan=plan,
+                            results=results,
+                            success=False,
+                            error_message=f"Safety check failed: {safety_check}",
+                            llm_feedback="Safety validation failed"
+                        )
             
             # Execute main command
             result = self.executor.execute(command)
             results.append(result)
             self.context.update_context(command, result)
             
+            # Handle command failure with intelligent validation
             if not result.allowed or result.exit_code != 0:
-                return ExecutionAttempt(
-                    attempt_number=attempt_num,
-                    timestamp=timestamp,
-                    plan=plan,
-                    results=results,
-                    success=False,
-                    error_message=f"Command failed: {command} - {result.stderr or result.reason}",
-                    llm_feedback=None
-                )
+                # Use smart executor's validation logic
+                from .smart_executor import SmartExecutor
+                temp_smart_executor = SmartExecutor(self.executor, self.analyzer, self.context)
+                validation = temp_smart_executor._validate_step_completion(step, result, plan.goal)
+                
+                if validation.get("continue", False):
+                    logger.info(f"Continuing despite failure: {validation.get('reason', 'Unknown reason')}")
+                    
+                    if validation.get("step_achieved", False):
+                        skipped_steps.append({
+                            "step": i+1,
+                            "description": description,
+                            "reason": validation.get("reason", ""),
+                            "command": command
+                        })
+                    
+                    continue
+                else:
+                    return ExecutionAttempt(
+                        attempt_number=1,
+                        timestamp=timestamp,
+                        plan=plan,
+                        results=results,
+                        success=False,
+                        error_message=f"Command failed: {command} - {validation.get('reason', result.stderr or result.reason)}",
+                        llm_feedback=validation.get("reason", "")
+                    )
+            
+            # Execute success verification if provided
+            success_check = step.get("success_verification", "") if isinstance(step, dict) else ""
+            if success_check:
+                verify_result = self.executor.execute(success_check)
+                if verify_result.exit_code != 0:
+                    logger.warning(f"Success verification failed: {success_check}")
+                    # This might not be a hard failure, but log it
         
-        return ExecutionAttempt(
-            attempt_number=attempt_num,
+        # Create successful attempt with skipped steps info
+        attempt = ExecutionAttempt(
+            attempt_number=1,
             timestamp=timestamp,
             plan=plan,
             results=results,
@@ -391,6 +453,42 @@ class EnhancedExecutor:
             error_message=None,
             llm_feedback=None
         )
+        
+        # Add skipped steps information
+        attempt.skipped_steps = skipped_steps
+        
+        return attempt
+
+    def _validate_prerequisite_failure(self, prereq_command: str, prereq_result: CommandResult, 
+                                     target_command: str) -> Dict[str, Any]:
+        """Validate if prerequisite failure should block execution"""
+        prompt = f"""
+        A prerequisite check failed before executing a command. Determine if this should block execution.
+        
+        Prerequisite Command: {prereq_command}
+        Prerequisite Error: {prereq_result.stderr}
+        Prerequisite Exit Code: {prereq_result.exit_code}
+        Target Command: {target_command}
+        
+        Analyze:
+        1. Is the prerequisite actually already satisfied?
+        2. Is this prerequisite check overly strict?
+        3. Can the target command still succeed?
+        
+        Common scenarios:
+        - Checking if user exists before adding to group (user might already be in group)
+        - Checking if package installed before configuring (package might be installed differently)
+        - Checking if service running before restart (service might be stopped intentionally)
+        
+        Respond in JSON: {{"continue": true/false, "reason": "explanation", "confidence": 0.8}}
+        """
+        
+        try:
+            response = self.analyzer._call_llm(prompt)
+            return json.loads(response)
+        except Exception as e:
+            logger.error(f"Prerequisite validation failed: {e}")
+            return {"continue": False, "reason": f"Validation failed: {str(e)}", "confidence": 0.0}
     
     def _get_llm_feedback_and_replan(self, failed_attempt: ExecutionAttempt, 
                                    prerequisites: Dict[str, Any]) -> ActionPlan:

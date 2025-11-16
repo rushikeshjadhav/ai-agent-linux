@@ -249,6 +249,13 @@ class SSHAgentCLI:
                     print(f"  {i}. {status} {cmd_result.command}")
                     if cmd_result.exit_code != 0:
                         print(f"     Error: {cmd_result.stderr[:100]}...")
+            
+            # Show skipped steps if any
+            if hasattr(result, 'skipped_steps') and result.skipped_steps:
+                print("\n⏭️ Skipped Steps (already completed):")
+                for skip in result.skipped_steps:
+                    print(f"  {skip['step']}. ✅ {skip['description']}")
+                    print(f"     Reason: {skip['reason']}")
         
         else:
             # For other modes, treat as direct command

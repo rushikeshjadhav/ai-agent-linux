@@ -29,6 +29,7 @@ class TaskResult:
     error_message: Optional[str] = None
     failure_contexts: List[FailureContext] = None
     recovery_attempts: int = 0
+    skipped_steps: List[Dict[str, Any]] = None
 
 @dataclass
 class ServiceResult:
@@ -317,7 +318,8 @@ class SmartExecutor:
         # Execute steps
         results = []
         completed_steps = 0
-        
+        skipped_steps = []
+
         for i, step in enumerate(action_plan.steps):
             # Handle both string and dict step formats
             if isinstance(step, dict):
@@ -352,25 +354,53 @@ class SmartExecutor:
                 )
             
             if result.exit_code != 0:
-                logger.error(f"Step {i+1} failed with exit code {result.exit_code}")
-                return TaskResult(
-                    task_description=task_description,
-                    success=False,
-                    steps_completed=completed_steps,
-                    total_steps=len(action_plan.steps),
-                    results=results,
-                    error_message=f"Command failed: {command} - {result.stderr}"
-                )
-            
-            completed_steps += 1
-        
-        return TaskResult(
+                logger.warning(f"Step {i+1} failed with exit code {result.exit_code}")
+                
+                # Validate if we should continue despite failure
+                validation = self._validate_step_completion(step, result, task_description)
+                
+                if validation.get("continue", False):
+                    logger.info(f"Continuing despite failure: {validation.get('reason', 'Unknown reason')}")
+                    
+                    if validation.get("step_achieved", False):
+                        completed_steps += 1
+                        skipped_steps.append({
+                            "step": i+1,
+                            "description": description,
+                            "reason": validation.get("reason", ""),
+                            "skip_reason": validation.get("skip_reason", "")
+                        })
+                    
+                    # Add validation info to result for tracking
+                    result.validation_info = validation
+                    continue
+                else:
+                    logger.error(f"Critical failure at step {i+1}: {validation.get('reason', 'Unknown')}")
+                    return TaskResult(
+                        task_description=task_description,
+                        success=False,
+                        steps_completed=completed_steps,
+                        total_steps=len(action_plan.steps),
+                        results=results,
+                        error_message=f"Critical failure: {validation.get('reason', result.stderr)}",
+                        skipped_steps=skipped_steps
+                    )
+            else:
+                completed_steps += 1
+
+        # Create successful result with skipped steps info
+        success_result = TaskResult(
             task_description=task_description,
             success=True,
             steps_completed=completed_steps,
             total_steps=len(action_plan.steps),
             results=results
         )
+
+        # Add skipped steps information
+        success_result.skipped_steps = skipped_steps
+
+        return success_result
     
     def _get_failure_recovery_plan(self, failed_result: TaskResult, original_task: str) -> Optional[ActionPlan]:
         """Get LLM-generated recovery plan for failed task with specific failure analysis"""
