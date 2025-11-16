@@ -457,6 +457,203 @@ class SmartExecutor:
                 "filesystem_info": {}
             }
     
+    def _interpret_exit_code(self, command: str, exit_code: int, stdout: str, stderr: str) -> Dict[str, Any]:
+        """Interpret exit codes in context - some non-zero codes are actually success states"""
+        
+        # Commands where non-zero exit codes can be normal/informational
+        command_patterns = {
+            # Package management - updates available
+            "dnf check-update": {100: "updates_available"},
+            "yum check-update": {100: "updates_available"},
+            "apt list --upgradable": {0: "success", 1: "no_updates"},
+            
+            # Package management - package states
+            "rpm -q": {1: "package_not_installed"},
+            "dpkg -l": {1: "package_not_found"},
+            "which": {1: "command_not_found"},
+            
+            # Search and comparison
+            "grep": {1: "no_matches", 2: "error"},
+            "diff": {1: "files_differ", 2: "error"},
+            "cmp": {1: "files_differ", 2: "error"},
+            
+            # System state checks
+            "systemctl is-active": {3: "service_inactive"},
+            "systemctl is-enabled": {1: "service_disabled"},
+            "test": {1: "condition_false"},
+            "ping": {1: "host_unreachable", 2: "network_error"},
+            
+            # File operations
+            "find": {1: "permission_denied_some_dirs"},
+            "ls": {2: "file_not_found"},
+            
+            # Process management
+            "killall": {1: "no_processes_found"},
+            "pkill": {1: "no_processes_found"},
+        }
+        
+        # Get the base command (first word)
+        base_command = command.split()[0]
+        
+        # Check for exact command matches first
+        for pattern, exit_codes in command_patterns.items():
+            if command.startswith(pattern) or base_command == pattern.split()[0]:
+                if exit_code in exit_codes:
+                    return {
+                        "is_error": False,
+                        "interpretation": exit_codes[exit_code],
+                        "message": f"Command returned expected exit code {exit_code}: {exit_codes[exit_code]}",
+                        "continue_execution": True
+                    }
+        
+        # Special handling for specific command patterns
+        if "check-update" in command:
+            if exit_code == 100:
+                return {
+                    "is_error": False,
+                    "interpretation": "updates_available",
+                    "message": "Updates are available for installation",
+                    "continue_execution": True
+                }
+            elif exit_code == 0:
+                return {
+                    "is_error": False,
+                    "interpretation": "no_updates",
+                    "message": "System is up to date",
+                    "continue_execution": True
+                }
+        
+        # Check for informational grep/search commands
+        if any(cmd in command for cmd in ["grep", "egrep", "fgrep"]):
+            if exit_code == 1:
+                return {
+                    "is_error": False,
+                    "interpretation": "no_matches",
+                    "message": "No matches found (normal for search commands)",
+                    "continue_execution": True
+                }
+        
+        # Check for test/conditional commands
+        if command.startswith("test ") or command.startswith("[ "):
+            if exit_code == 1:
+                return {
+                    "is_error": False,
+                    "interpretation": "condition_false",
+                    "message": "Test condition evaluated to false",
+                    "continue_execution": True
+                }
+        
+        # Check for which/command existence checks
+        if command.startswith("which ") or command.startswith("command -v "):
+            if exit_code == 1:
+                return {
+                    "is_error": False,
+                    "interpretation": "command_not_found",
+                    "message": "Command not found in PATH (informational)",
+                    "continue_execution": True
+                }
+        
+        # Check stderr for additional context
+        if stderr:
+            stderr_lower = stderr.lower()
+            
+            # Some commands write informational messages to stderr
+            informational_patterns = [
+                "no updates available",
+                "already up to date",
+                "nothing to do",
+                "no packages marked for update",
+                "0 upgraded, 0 newly installed"
+            ]
+            
+            if any(pattern in stderr_lower for pattern in informational_patterns):
+                return {
+                    "is_error": False,
+                    "interpretation": "informational",
+                    "message": f"Command completed with informational message: {stderr.strip()}",
+                    "continue_execution": True
+                }
+        
+        # Check stdout for success indicators even with non-zero exit
+        if stdout:
+            stdout_lower = stdout.lower()
+            
+            success_patterns = [
+                "completed successfully",
+                "operation successful",
+                "done",
+                "finished"
+            ]
+            
+            if any(pattern in stdout_lower for pattern in success_patterns):
+                return {
+                    "is_error": False,
+                    "interpretation": "success_with_info",
+                    "message": f"Command completed successfully with exit code {exit_code}",
+                    "continue_execution": True
+                }
+        
+        # For ambiguous cases, consult LLM
+        if exit_code != 0 and exit_code < 128:  # Don't consult for signals (128+)
+            logger.debug(f"Consulting LLM for exit code interpretation: {command} (exit: {exit_code})")
+            llm_interpretation = self._consult_llm_for_exit_code(command, exit_code, stdout, stderr)
+            
+            if llm_interpretation.get("continue_execution", False):
+                return llm_interpretation
+        
+        # Default: treat as error for unknown patterns
+        return {
+            "is_error": True,
+            "interpretation": "error",
+            "message": f"Command failed with exit code {exit_code}",
+            "continue_execution": False
+        }
+    
+    def _consult_llm_for_exit_code(self, command: str, exit_code: int, stdout: str, stderr: str) -> Dict[str, Any]:
+        """Ask LLM to interpret an ambiguous exit code"""
+        if not self.analyzer._client:
+            return {"is_error": True, "interpretation": "unknown", "message": "LLM unavailable"}
+        
+        prompt = f"""
+        Interpret this command's exit code in context:
+        
+        Command: {command}
+        Exit Code: {exit_code}
+        Stdout: {stdout[:500]}
+        Stderr: {stderr[:500]}
+        
+        Is this exit code indicating:
+        1. Success/completion (even if non-zero)
+        2. Informational state (like "updates available")
+        3. Actual error that should stop execution
+        
+        Consider common patterns:
+        - Package managers often use 100 for "updates available"
+        - Search commands use 1 for "no results found"
+        - Test commands use 1 for "condition false"
+        - System state commands use various codes for different states
+        
+        Respond in JSON:
+        {{
+            "is_error": false,
+            "interpretation": "updates_available",
+            "message": "explanation",
+            "continue_execution": true
+        }}
+        """
+        
+        try:
+            response = self.analyzer._call_llm(prompt)
+            return json.loads(response)
+        except Exception as e:
+            logger.error(f"LLM exit code interpretation failed: {e}")
+            return {
+                "is_error": True,
+                "interpretation": "unknown",
+                "message": f"Could not interpret exit code {exit_code}",
+                "continue_execution": False
+            }
+
     def _should_invalidate_cache(self, task_description: str) -> bool:
         """Determine if a task might change system state and require cache invalidation"""
         system_changing_keywords = [
@@ -639,11 +836,63 @@ class SmartExecutor:
             if result.exit_code != 0:
                 logger.warning(f"Step {i+1} failed with exit code {result.exit_code}")
                 
-                # Validate if we should continue despite failure
+                # Interpret the exit code in context
+                exit_interpretation = self._interpret_exit_code(
+                    result.command, 
+                    result.exit_code, 
+                    result.stdout, 
+                    result.stderr
+                )
+                
+                if not exit_interpretation["is_error"]:
+                    logger.info(f"Step {i+1} completed with informational exit code: {exit_interpretation['message']}")
+                    completed_steps += 1
+                    
+                    # Add interpretation info to result
+                    result = CommandResult(
+                        stdout=result.stdout,
+                        stderr=result.stderr,
+                        exit_code=result.exit_code,
+                        command=result.command,
+                        allowed=result.allowed,
+                        reason=result.reason,
+                        validation_info={
+                            "exit_interpretation": exit_interpretation,
+                            "treated_as_success": True
+                        }
+                    )
+                    results[-1] = result
+                    continue
+                
+                # If it's a real error, proceed with existing validation logic
                 validation = self._validate_step_completion(step, result, task_description)
                 
                 if validation.get("continue", False):
                     logger.info(f"Continuing despite failure: {validation.get('reason', 'Unknown reason')}")
+                    
+                    # Check if LLM provided a corrected command with generated values
+                    generated_command = validation.get("generated_command", "")
+                    if generated_command and generated_command != command:
+                        logger.info(f"Executing corrected command with generated values: {generated_command}")
+                        
+                        # Execute the corrected command
+                        corrected_result = self.executor.execute(generated_command)
+                        results.append(corrected_result)
+                        self.context.update_context(generated_command, corrected_result)
+                        
+                        if corrected_result.exit_code == 0:
+                            logger.info("Corrected command succeeded!")
+                            completed_steps += 1
+                            
+                            # Log what was generated
+                            generated_values = validation.get("generated_values", {})
+                            if generated_values:
+                                logger.info(f"Auto-generated values: {list(generated_values.keys())}")
+                            
+                            continue
+                        else:
+                            logger.error(f"Corrected command also failed: {corrected_result.stderr}")
+                            # Fall through to normal failure handling
                     
                     if validation.get("step_achieved", False):
                         completed_steps += 1

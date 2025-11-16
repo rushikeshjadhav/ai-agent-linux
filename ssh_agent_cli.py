@@ -245,19 +245,31 @@ class SSHAgentCLI:
             if result.results:
                 print("\n📝 Command Results:")
                 for i, cmd_result in enumerate(result.results, 1):
-                    status = "✅" if cmd_result.exit_code == 0 else "❌"
-                    print(f"  {i}. {status} {cmd_result.command}")
-                    if cmd_result.exit_code != 0:
-                        print(f"     Error: {cmd_result.stderr[:100]}...")
+                    # Check if exit code was interpreted
+                    validation_info = getattr(cmd_result, 'validation_info', {})
+                    exit_interpretation = validation_info.get('exit_interpretation', {})
+                    treated_as_success = validation_info.get('treated_as_success', False)
+                    
+                    if treated_as_success:
+                        status = "ℹ️"  # Informational
+                        print(f"  {i}. {status} {cmd_result.command} (exit: {cmd_result.exit_code})")
+                        print(f"     Info: {exit_interpretation.get('message', 'Informational exit code')}")
+                    elif cmd_result.exit_code == 0:
+                        status = "✅"
+                        print(f"  {i}. {status} {cmd_result.command}")
+                    else:
+                        status = "❌"
+                        print(f"  {i}. {status} {cmd_result.command} (exit: {cmd_result.exit_code})")
+                        if cmd_result.stderr:
+                            print(f"     Error: {cmd_result.stderr[:100]}...")
                     
                     # Show auto-generated values if any
-                    if hasattr(cmd_result, 'validation_info'):
-                        validation_info = cmd_result.validation_info
-                        generated_values = validation_info.get('generated_values', {})
+                    if hasattr(cmd_result, 'validation_info') and cmd_result.validation_info:
+                        generated_values = cmd_result.validation_info.get('generated_values', {})
                         if generated_values:
                             print(f"     🔧 Auto-generated: {', '.join(generated_values.keys())}")
                         
-                        generated_command = validation_info.get('generated_command', '')
+                        generated_command = cmd_result.validation_info.get('generated_command', '')
                         if generated_command and generated_command != cmd_result.command:
                             print(f"     🔄 Corrected to: {generated_command}")
             
