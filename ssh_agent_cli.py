@@ -127,10 +127,25 @@ class SSHAgentCLI:
             else:
                 print("❌ Invalid choice. Please enter 1, 2, or 3.")
     
-    def connect_to_server(self) -> bool:
+    def connect_to_server(self, args=None) -> bool:
         """Handle server connection"""
-        hostname, username, port = self.prompt_server_details()
-        mode = self.prompt_agent_mode()
+        if args and args.hostname and args.username:
+            # Use CLI arguments
+            hostname = args.hostname
+            username = args.username
+            port = args.port
+            
+            # Convert mode string to enum
+            mode_map = {
+                "ro": AgentMode.READ_ONLY,
+                "rw": AgentMode.READ_WRITE,
+                "smart": AgentMode.INTELLIGENT
+            }
+            mode = mode_map[args.mode]
+        else:
+            # Use interactive prompts
+            hostname, username, port = self.prompt_server_details()
+            mode = self.prompt_agent_mode()
         
         # Auto-detect LLM provider based on available API keys
         llm_provider = None
@@ -152,25 +167,45 @@ class SSHAgentCLI:
         # Create agent with detected LLM provider
         self.agent = SSHAgent(hostname, username, mode, port, llm_provider, llm_api_key)
         
-        # Choose connection method
-        method = self.prompt_connection_method()
-        
         print(f"\n🔌 Connecting to {username}@{hostname}:{port}...")
         
-        if method == "1":  # SSH key
-            key_path = self.prompt_ssh_key()
-            if not key_path:
+        # Determine connection method
+        if args and args.key:
+            # Use specified SSH key
+            key_path = Path(args.key).expanduser()
+            if not key_path.exists():
+                print(f"❌ SSH key not found: {key_path}")
                 return False
             
             passphrase = None
-            if input(f"Does {key_path.name} have a passphrase? (y/N): ").lower().startswith('y'):
+            if not args or input(f"Does {key_path.name} have a passphrase? (y/N): ").lower().startswith('y'):
                 passphrase = getpass.getpass("Enter passphrase: ")
             
             success = self.agent.connect_with_key(key_path, passphrase)
             
-        else:  # Password
+        elif args and args.password:
+            # Use password authentication
             password = getpass.getpass("Enter password: ")
             success = self.agent.connect_with_password(password)
+            
+        else:
+            # Interactive method selection
+            method = self.prompt_connection_method()
+            
+            if method == "1":  # SSH key
+                key_path = self.prompt_ssh_key()
+                if not key_path:
+                    return False
+                
+                passphrase = None
+                if input(f"Does {key_path.name} have a passphrase? (y/N): ").lower().startswith('y'):
+                    passphrase = getpass.getpass("Enter passphrase: ")
+                
+                success = self.agent.connect_with_key(key_path, passphrase)
+                
+            else:  # Password
+                password = getpass.getpass("Enter password: ")
+                success = self.agent.connect_with_password(password)
         
         if success:
             print(f"✅ Connected successfully!")
@@ -181,7 +216,7 @@ class SSHAgentCLI:
             print("❌ Connection failed!")
             return False
     
-    def execute_task(self, task: str):
+    def execute_task(self, task: str, auto_approve: bool = False):
         """Execute a user-specified task"""
         if not self.connected or not self.agent:
             print("❌ Not connected to server")
@@ -193,8 +228,9 @@ class SSHAgentCLI:
         if self.agent.mode == AgentMode.INTELLIGENT:
             print("🧠 Using intelligent execution...")
             
-            # Ask for approval
-            auto_approve = input("Auto-approve all steps? (y/N): ").lower().startswith('y')
+            # Use provided auto_approve or ask for approval
+            if not auto_approve:
+                auto_approve = input("Auto-approve all steps? (y/N): ").lower().startswith('y')
             
             result = self.agent.execute_smart_action(task, auto_approve)
             
@@ -304,12 +340,12 @@ class SSHAgentCLI:
         
         try:
             # Connect to server
-            if not self.connect_to_server():
+            if not self.connect_to_server(args):
                 return 1
             
             # Execute specific task if provided
             if args.task:
-                self.execute_task(args.task)
+                self.execute_task(args.task, args.auto_approve)
             else:
                 # Run interactive session
                 self.interactive_session()
@@ -334,10 +370,11 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  %(prog)s                           # Interactive mode
-  %(prog)s -t "check disk space"     # Execute specific task
-  %(prog)s -t "install nginx"        # Install software
-  %(prog)s -t "restart apache"       # Manage services
+  %(prog)s                                    # Interactive mode
+  %(prog)s -H localhost -u testuser --password -t "check disk space"
+  %(prog)s -H 192.168.1.100 -u admin -k ~/.ssh/id_rsa -m smart -t "install nginx"
+  %(prog)s -H server.com -u root -p 2222 --password -m rw -t "restart apache"
+  %(prog)s -H localhost -u testuser --password --auto-approve -t "update system"
   
 Environment Variables:
   OPENAI_API_KEY      # For OpenAI LLM features
@@ -348,6 +385,47 @@ Environment Variables:
     parser.add_argument(
         "-t", "--task",
         help="Specific task to execute (otherwise interactive mode)"
+    )
+    
+    parser.add_argument(
+        "-H", "--hostname",
+        help="Server hostname or IP address"
+    )
+    
+    parser.add_argument(
+        "-u", "--username",
+        help="SSH username"
+    )
+    
+    parser.add_argument(
+        "-p", "--port",
+        type=int,
+        default=22,
+        help="SSH port (default: 22)"
+    )
+    
+    parser.add_argument(
+        "-k", "--key",
+        help="Path to SSH private key file"
+    )
+    
+    parser.add_argument(
+        "--password",
+        action="store_true",
+        help="Use password authentication (will prompt for password)"
+    )
+    
+    parser.add_argument(
+        "-m", "--mode",
+        choices=["ro", "rw", "smart"],
+        default="ro",
+        help="Agent mode: ro (read-only), rw (read-write), smart (intelligent) (default: ro)"
+    )
+    
+    parser.add_argument(
+        "--auto-approve",
+        action="store_true",
+        help="Auto-approve all steps in intelligent mode"
     )
     
     parser.add_argument(
