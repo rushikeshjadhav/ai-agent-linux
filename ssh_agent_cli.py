@@ -129,7 +129,7 @@ class SSHAgentCLI:
     
     def connect_to_server(self, args=None) -> bool:
         """Handle server connection"""
-        if args and args.hostname and args.username:
+        if args and hasattr(args, 'hostname') and args.hostname and hasattr(args, 'username') and args.username:
             # Use CLI arguments
             hostname = args.hostname
             username = args.username
@@ -170,7 +170,7 @@ class SSHAgentCLI:
         print(f"\n🔌 Connecting to {username}@{hostname}:{port}...")
         
         # Determine connection method
-        if args and args.key:
+        if args and hasattr(args, 'key') and args.key:
             # Use specified SSH key
             key_path = Path(args.key).expanduser()
             if not key_path.exists():
@@ -178,12 +178,12 @@ class SSHAgentCLI:
                 return False
             
             passphrase = None
-            if not args or input(f"Does {key_path.name} have a passphrase? (y/N): ").lower().startswith('y'):
+            if input(f"Does {key_path.name} have a passphrase? (y/N): ").lower().startswith('y'):
                 passphrase = getpass.getpass("Enter passphrase: ")
             
             success = self.agent.connect_with_key(key_path, passphrase)
             
-        elif args and args.password:
+        elif args and hasattr(args, 'password') and args.password:
             # Use password authentication
             password = getpass.getpass("Enter password: ")
             success = self.agent.connect_with_password(password)
