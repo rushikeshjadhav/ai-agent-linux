@@ -737,7 +737,15 @@ class SmartExecutor:
                             result = self._execute_task_attempt(revised_task, auto_approve)
                             break
             else:
-                logger.error("No recovery plan generated, stopping attempts")
+                logger.error("ERROR - No recovery plan generated, stopping attempts")
+                logger.error(f"Recovery attempt {recovery_attempts} failed to generate a plan")
+                logger.error(f"Original task: {original_task}")
+                logger.error(f"Last failure: {result.error_message}")
+                if result.results:
+                    last_result = result.results[-1]
+                    logger.error(f"Last failed command: {last_result.command}")
+                    logger.error(f"Last exit code: {last_result.exit_code}")
+                    logger.error(f"Last stderr: {last_result.stderr}")
                 break
         
         # Update result with recovery information
@@ -947,6 +955,7 @@ class SmartExecutor:
     def _get_failure_recovery_plan(self, failed_result: TaskResult, original_task: str) -> Optional[ActionPlan]:
         """Get LLM-generated recovery plan for failed task with specific failure analysis"""
         if not failed_result.results:
+            logger.warning("No results in failed_result, cannot generate recovery plan")
             return None
         
         # Get the failed command and analyze it
@@ -970,18 +979,39 @@ class SmartExecutor:
                 original_task, failed_command_result, failure_analysis, current_state
             )
         
+        # Log the prompt being sent to LLM for debugging
+        logger.info("=== RECOVERY PLAN PROMPT SENT TO LLM ===")
+        logger.info(f"Failure type: {failure_analysis['failure_type']}")
+        logger.info(f"Original task: {original_task}")
+        logger.info(f"Failed command: {failed_command_result.command}")
+        logger.info(f"Exit code: {failed_command_result.exit_code}")
+        logger.info(f"Error: {failed_command_result.stderr}")
+        logger.info("--- FULL PROMPT ---")
+        logger.info(prompt)
+        logger.info("=== END RECOVERY PLAN PROMPT ===")
+        
         try:
             response = self.analyzer._call_llm(prompt)
+            logger.info("=== LLM RECOVERY PLAN RESPONSE ===")
+            logger.info(response)
+            logger.info("=== END LLM RESPONSE ===")
+            
             recovery_plan = self.analyzer._parse_action_plan(response)
             
             # If recovery plan fails, create fallback plan
             if not recovery_plan.steps:
+                logger.warning("LLM returned empty recovery plan, creating fallback")
+                logger.info(f"Recovery plan goal: '{recovery_plan.goal}'")
+                logger.info(f"Recovery plan steps: {recovery_plan.steps}")
+                logger.info(f"Recovery plan risks: {recovery_plan.risks}")
                 return self._create_fallback_plan(original_task, failure_analysis)
             
+            logger.info(f"Successfully generated recovery plan with {len(recovery_plan.steps)} steps")
             return recovery_plan
             
         except Exception as e:
             logger.error(f"Failed to get recovery plan: {e}")
+            logger.exception("Full traceback for recovery plan failure:")
             return self._create_fallback_plan(original_task, failure_analysis)
     
     def _validate_step_completion(self, step: Dict[str, Any], result: CommandResult, 
