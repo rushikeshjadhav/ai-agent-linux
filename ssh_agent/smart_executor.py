@@ -90,57 +90,131 @@ class SmartExecutor:
         return None
     
     def _save_environment_cache(self, env_info: Dict[str, Any]):
-        """Save environment info to cache"""
+        """Save environment info to cache on remote server"""
         try:
-            # Create cache key based on connection details
-            connection_key = f"{self.executor.connection.hostname}_{self.executor.connection.username}_{self.executor.connection.port}"
-            cache_file = self.cache_dir / f"env_{hashlib.md5(connection_key.encode()).hexdigest()}.json"
+            import json
             
+            # Create cache data with metadata
             cache_data = {
                 "timestamp": datetime.now().isoformat(),
-                "connection_key": connection_key,
+                "version": "1.0",
+                "connection_key": f"{self.executor.connection.hostname}_{self.executor.connection.username}_{self.executor.connection.port}",
                 "environment_info": env_info
             }
             
-            with open(cache_file, 'w') as f:
-                json.dump(cache_data, f, indent=2)
+            # Convert to JSON
+            json_data = json.dumps(cache_data, indent=2)
             
-            # Update memory cache
+            # Save to remote server using echo with proper escaping
+            cache_file = "/tmp/ssh_agent_env_cache.json"
+            
+            # First, create the cache directory if it doesn't exist
+            mkdir_result = self.executor.execute("mkdir -p /tmp")
+            if not mkdir_result.allowed:
+                logger.warning("Cannot create /tmp directory for cache")
+                return
+            
+            # Use a more reliable method to write the JSON file
+            # First write to a temporary file, then move it
+            temp_file = f"/tmp/ssh_agent_env_temp_{int(datetime.now().timestamp())}.json"
+            
+            # Escape the JSON data for shell
+            escaped_json = json_data.replace("'", "'\"'\"'").replace("\n", "\\n")
+            
+            # Write using printf to handle special characters better
+            write_cmd = f"printf '%s' '{escaped_json}' > {temp_file}"
+            write_result = self.executor.execute(write_cmd)
+            
+            if write_result.allowed and write_result.exit_code == 0:
+                # Move temp file to final location
+                move_result = self.executor.execute(f"mv {temp_file} {cache_file}")
+                if move_result.allowed and move_result.exit_code == 0:
+                    logger.info(f"Environment cache saved to {cache_file} on remote server")
+                    
+                    # Verify the file was written correctly
+                    verify_result = self.executor.execute(f"test -f {cache_file} && wc -c {cache_file}")
+                    if verify_result.allowed and verify_result.exit_code == 0:
+                        file_size = verify_result.stdout.strip().split()[0]
+                        logger.debug(f"Cache file size: {file_size} bytes")
+                    else:
+                        logger.warning("Could not verify cache file was written")
+                else:
+                    logger.warning(f"Failed to move temp cache file: {move_result.stderr}")
+                    # Clean up temp file
+                    self.executor.execute(f"rm -f {temp_file}")
+            else:
+                logger.warning(f"Failed to write environment cache: {write_result.stderr}")
+            
+            # Update memory cache regardless of file write success
             self._environment_cache = env_info
             self._cache_timestamp = datetime.now()
             
-            logger.debug(f"Saved environment cache to {cache_file}")
-            
         except Exception as e:
-            logger.warning(f"Failed to save environment cache: {e}")
+            logger.error(f"Error saving environment cache: {e}")
+            logger.exception("Full traceback:")
     
     def _load_environment_cache(self) -> Optional[Dict[str, Any]]:
-        """Load environment info from disk cache if valid"""
+        """Load environment info from remote server cache if valid"""
         try:
-            connection_key = f"{self.executor.connection.hostname}_{self.executor.connection.username}_{self.executor.connection.port}"
-            cache_file = self.cache_dir / f"env_{hashlib.md5(connection_key.encode()).hexdigest()}.json"
+            cache_file = "/tmp/ssh_agent_env_cache.json"
             
-            if not cache_file.exists():
+            # Check if cache file exists on remote server
+            check_result = self.executor.execute(f"test -f {cache_file} && echo 'exists' || echo 'missing'")
+            if not check_result.allowed or "missing" in check_result.stdout:
+                logger.debug("Environment cache file not found on remote server")
                 return None
             
-            with open(cache_file, 'r') as f:
-                cache_data = json.load(f)
+            # Check cache age
+            stat_result = self.executor.execute(f"stat -c %Y {cache_file}")
+            if not stat_result.allowed or stat_result.exit_code != 0:
+                logger.debug("Could not check cache file age")
+                return None
             
-            # Check if cache is still valid
-            cache_time = datetime.fromisoformat(cache_data["timestamp"])
-            age = datetime.now() - cache_time
+            try:
+                cache_timestamp = int(stat_result.stdout.strip())
+                current_time = int(datetime.now().timestamp())
+                age_minutes = (current_time - cache_timestamp) / 60
+                
+                if age_minutes > self.cache_ttl_minutes:
+                    logger.debug(f"Environment cache expired (age: {age_minutes:.1f} minutes)")
+                    return None
+            except ValueError:
+                logger.debug("Invalid cache timestamp")
+                return None
             
-            if age < timedelta(minutes=self.cache_ttl_minutes):
+            # Load cache content
+            cat_result = self.executor.execute(f"cat {cache_file}")
+            if not cat_result.allowed or cat_result.exit_code != 0:
+                logger.debug("Could not read cache file")
+                return None
+            
+            # Parse JSON content
+            try:
+                cached_data = json.loads(cat_result.stdout)
+                
                 # Verify connection key matches
-                if cache_data.get("connection_key") == connection_key:
-                    return cache_data["environment_info"]
-            
-            # Cache expired or invalid, remove it
-            cache_file.unlink()
-            return None
-            
+                expected_key = f"{self.executor.connection.hostname}_{self.executor.connection.username}_{self.executor.connection.port}"
+                if cached_data.get("connection_key") != expected_key:
+                    logger.debug("Cache connection key mismatch")
+                    return None
+                
+                env_info = cached_data.get("environment_info")
+                if not env_info or not isinstance(env_info, dict):
+                    logger.warning("Invalid environment info in cache")
+                    return None
+                
+                logger.info(f"Loaded environment cache from remote server (age: {age_minutes:.1f} minutes)")
+                return env_info
+                
+            except json.JSONDecodeError as e:
+                logger.warning(f"Invalid cache file format: {e}")
+                # Remove corrupted cache
+                self.executor.execute(f"rm -f {cache_file}")
+                return None
+                
         except Exception as e:
-            logger.warning(f"Failed to load environment cache: {e}")
+            logger.error(f"Error loading environment cache: {e}")
+            logger.exception("Full traceback:")
             return None
     
     def _invalidate_environment_cache(self):
@@ -164,10 +238,12 @@ class SmartExecutor:
         # Try to get cached info first
         cached_info = self._get_cached_environment_info()
         if cached_info:
+            logger.debug("Using cached environment information")
             return cached_info
         
         logger.info("Collecting fresh environment information...")
         
+        # Initialize with safe defaults
         env_info = {
             "distribution": {},
             "package_manager": {},
@@ -178,127 +254,208 @@ class SmartExecutor:
             "filesystem_info": {}
         }
         
-        # Distribution information
-        dist_commands = [
-            ("os_release", "cat /etc/os-release"),
-            ("lsb_release", "lsb_release -a 2>/dev/null || echo 'lsb_release not available'"),
-            ("redhat_release", "cat /etc/redhat-release 2>/dev/null || echo 'not redhat'"),
-            ("debian_version", "cat /etc/debian_version 2>/dev/null || echo 'not debian'"),
-            ("kernel", "uname -r"),
-            ("architecture", "uname -m")
-        ]
-        
-        for key, cmd in dist_commands:
-            result = self.executor.execute(cmd)
-            if result.allowed and result.exit_code == 0:
-                env_info["distribution"][key] = result.stdout.strip()
-        
-        # Package manager detection and info
-        pkg_managers = [
-            ("apt", "apt --version 2>/dev/null"),
-            ("yum", "yum --version 2>/dev/null"),
-            ("dnf", "dnf --version 2>/dev/null"),
-            ("pacman", "pacman --version 2>/dev/null"),
-            ("zypper", "zypper --version 2>/dev/null"),
-            ("apk", "apk --version 2>/dev/null")
-        ]
-        
-        for manager, cmd in pkg_managers:
-            result = self.executor.execute(cmd)
-            if result.allowed and result.exit_code == 0:
-                env_info["package_manager"][manager] = {
-                    "available": True,
-                    "version": result.stdout.strip()[:100]
+        try:
+            # Distribution information
+            dist_commands = [
+                ("os_release", "cat /etc/os-release"),
+                ("lsb_release", "lsb_release -a 2>/dev/null || echo 'lsb_release not available'"),
+                ("redhat_release", "cat /etc/redhat-release 2>/dev/null || echo 'not redhat'"),
+                ("debian_version", "cat /etc/debian_version 2>/dev/null || echo 'not debian'"),
+                ("kernel", "uname -r"),
+                ("architecture", "uname -m")
+            ]
+            
+            for key, cmd in dist_commands:
+                try:
+                    result = self.executor.execute(cmd)
+                    if result and result.allowed and result.exit_code == 0:
+                        env_info["distribution"][key] = result.stdout.strip()
+                    else:
+                        logger.debug(f"Distribution command failed: {cmd} - {getattr(result, 'stderr', 'No result')}")
+                        env_info["distribution"][key] = "unknown"
+                except Exception as e:
+                    logger.warning(f"Failed to execute distribution command '{cmd}': {e}")
+                    env_info["distribution"][key] = "error"
+            
+            # Package manager detection and info
+            pkg_managers = [
+                ("apt", "apt --version 2>/dev/null"),
+                ("yum", "yum --version 2>/dev/null"),
+                ("dnf", "dnf --version 2>/dev/null"),
+                ("pacman", "pacman --version 2>/dev/null"),
+                ("zypper", "zypper --version 2>/dev/null"),
+                ("apk", "apk --version 2>/dev/null")
+            ]
+            
+            for manager, cmd in pkg_managers:
+                try:
+                    result = self.executor.execute(cmd)
+                    if result and result.allowed and result.exit_code == 0:
+                        env_info["package_manager"][manager] = {
+                            "available": True,
+                            "version": result.stdout.strip()[:100]
+                        }
+                        # Get repository info for available package managers
+                        if manager == "apt":
+                            try:
+                                repo_result = self.executor.execute("apt-cache policy | head -20")
+                                if repo_result and repo_result.allowed and repo_result.exit_code == 0:
+                                    env_info["package_manager"][manager]["repositories"] = repo_result.stdout
+                            except Exception as e:
+                                logger.debug(f"Failed to get apt repositories: {e}")
+                        elif manager == "yum":
+                            try:
+                                repo_result = self.executor.execute("yum repolist")
+                                if repo_result and repo_result.allowed and repo_result.exit_code == 0:
+                                    env_info["package_manager"][manager]["repositories"] = repo_result.stdout
+                            except Exception as e:
+                                logger.debug(f"Failed to get yum repositories: {e}")
+                    else:
+                        env_info["package_manager"][manager] = {"available": False}
+                except Exception as e:
+                    logger.warning(f"Failed to check package manager '{manager}': {e}")
+                    env_info["package_manager"][manager] = {"available": False, "error": str(e)}
+            
+            # Available tools and commands
+            common_tools = [
+                "curl", "wget", "git", "vim", "nano", "htop", "tree", "unzip", "zip",
+                "docker", "nginx", "apache2", "mysql", "python3", "pip", "node", "npm",
+                "java", "gcc", "make", "systemctl", "service", "crontab", "iptables",
+                "ufw", "firewall-cmd", "ss", "netstat", "rsync", "tar", "gzip"
+            ]
+            
+            for tool in common_tools:
+                try:
+                    result = self.executor.execute(f"which {tool} 2>/dev/null")
+                    if result and result.allowed and result.exit_code == 0:
+                        # Try to get version info
+                        version_result = self.executor.execute(f"{tool} --version 2>/dev/null | head -1")
+                        version_info = "unknown"
+                        if version_result and version_result.allowed and version_result.exit_code == 0:
+                            version_info = version_result.stdout.strip()[:100]
+                        
+                        env_info["available_tools"][tool] = {
+                            "available": True,
+                            "path": result.stdout.strip(),
+                            "version": version_info
+                        }
+                    else:
+                        env_info["available_tools"][tool] = {"available": False}
+                except Exception as e:
+                    logger.debug(f"Failed to check tool '{tool}': {e}")
+                    env_info["available_tools"][tool] = {"available": False, "error": str(e)}
+            
+            # System resources
+            resource_commands = [
+                ("memory", "free -h"),
+                ("disk_space", "df -h"),
+                ("cpu_info", "cat /proc/cpuinfo | grep 'model name' | head -1"),
+                ("load_average", "uptime"),
+                ("running_processes", "ps aux | wc -l")
+            ]
+            
+            for key, cmd in resource_commands:
+                try:
+                    result = self.executor.execute(cmd)
+                    if result and result.allowed and result.exit_code == 0:
+                        env_info["system_resources"][key] = result.stdout.strip()
+                    else:
+                        env_info["system_resources"][key] = "unavailable"
+                except Exception as e:
+                    logger.debug(f"Failed to get system resource '{key}': {e}")
+                    env_info["system_resources"][key] = f"error: {str(e)}"
+            
+            # Network information
+            network_commands = [
+                ("interfaces", "ip addr show | grep -E '^[0-9]+:' | head -5"),
+                ("routing", "ip route | head -5"),
+                ("dns", "cat /etc/resolv.conf | grep nameserver"),
+                ("connectivity", "ping -c 1 8.8.8.8 2>/dev/null && echo 'internet_ok' || echo 'no_internet'")
+            ]
+            
+            for key, cmd in network_commands:
+                try:
+                    result = self.executor.execute(cmd)
+                    if result and result.allowed and result.exit_code == 0:
+                        env_info["network_info"][key] = result.stdout.strip()
+                    else:
+                        env_info["network_info"][key] = "unavailable"
+                except Exception as e:
+                    logger.debug(f"Failed to get network info '{key}': {e}")
+                    env_info["network_info"][key] = f"error: {str(e)}"
+            
+            # User and permission context
+            user_commands = [
+                ("current_user", "whoami"),
+                ("user_id", "id"),
+                ("sudo_access", "sudo -n true 2>/dev/null && echo 'has_sudo' || echo 'no_sudo'"),
+                ("home_directory", "echo $HOME"),
+                ("current_directory", "pwd"),
+                ("shell", "echo $SHELL")
+            ]
+            
+            for key, cmd in user_commands:
+                try:
+                    result = self.executor.execute(cmd)
+                    if result and result.allowed and result.exit_code == 0:
+                        env_info["user_context"][key] = result.stdout.strip()
+                    else:
+                        env_info["user_context"][key] = "unavailable"
+                except Exception as e:
+                    logger.debug(f"Failed to get user context '{key}': {e}")
+                    env_info["user_context"][key] = f"error: {str(e)}"
+            
+            # Filesystem information
+            fs_commands = [
+                ("mount_points", "mount | head -10"),
+                ("filesystem_types", "df -T"),
+                ("disk_usage_summary", "du -sh /var /tmp /home 2>/dev/null | head -5")
+            ]
+            
+            for key, cmd in fs_commands:
+                try:
+                    result = self.executor.execute(cmd)
+                    if result and result.allowed and result.exit_code == 0:
+                        env_info["filesystem_info"][key] = result.stdout.strip()
+                    else:
+                        env_info["filesystem_info"][key] = "unavailable"
+                except Exception as e:
+                    logger.debug(f"Failed to get filesystem info '{key}': {e}")
+                    env_info["filesystem_info"][key] = f"error: {str(e)}"
+            
+            # Validate env_info structure
+            if not isinstance(env_info, dict):
+                logger.error("Environment info is not a dictionary!")
+                env_info = {
+                    "distribution": {"error": "collection_failed"},
+                    "package_manager": {},
+                    "available_tools": {},
+                    "system_resources": {},
+                    "network_info": {},
+                    "user_context": {},
+                    "filesystem_info": {}
                 }
-                # Get repository info for available package managers
-                if manager == "apt":
-                    repo_result = self.executor.execute("apt-cache policy | head -20")
-                    if repo_result.allowed and repo_result.exit_code == 0:
-                        env_info["package_manager"][manager]["repositories"] = repo_result.stdout
-                elif manager == "yum":
-                    repo_result = self.executor.execute("yum repolist")
-                    if repo_result.allowed and repo_result.exit_code == 0:
-                        env_info["package_manager"][manager]["repositories"] = repo_result.stdout
-            else:
-                env_info["package_manager"][manager] = {"available": False}
-        
-        # Available tools and commands
-        common_tools = [
-            "curl", "wget", "git", "vim", "nano", "htop", "tree", "unzip", "zip",
-            "docker", "nginx", "apache2", "mysql", "python3", "pip", "node", "npm",
-            "java", "gcc", "make", "systemctl", "service", "crontab", "iptables",
-            "ufw", "firewall-cmd", "ss", "netstat", "rsync", "tar", "gzip"
-        ]
-        
-        for tool in common_tools:
-            result = self.executor.execute(f"which {tool} 2>/dev/null && {tool} --version 2>/dev/null | head -1")
-            if result.allowed and result.exit_code == 0:
-                env_info["available_tools"][tool] = {
-                    "available": True,
-                    "path": result.stdout.split('\n')[0] if result.stdout else "unknown",
-                    "version": result.stdout.split('\n')[1] if len(result.stdout.split('\n')) > 1 else "unknown"
-                }
-            else:
-                env_info["available_tools"][tool] = {"available": False}
-        
-        # System resources
-        resource_commands = [
-            ("memory", "free -h"),
-            ("disk_space", "df -h"),
-            ("cpu_info", "cat /proc/cpuinfo | grep 'model name' | head -1"),
-            ("load_average", "uptime"),
-            ("running_processes", "ps aux | wc -l")
-        ]
-        
-        for key, cmd in resource_commands:
-            result = self.executor.execute(cmd)
-            if result.allowed and result.exit_code == 0:
-                env_info["system_resources"][key] = result.stdout.strip()
-        
-        # Network information
-        network_commands = [
-            ("interfaces", "ip addr show | grep -E '^[0-9]+:' | head -5"),
-            ("routing", "ip route | head -5"),
-            ("dns", "cat /etc/resolv.conf | grep nameserver"),
-            ("connectivity", "ping -c 1 8.8.8.8 2>/dev/null && echo 'internet_ok' || echo 'no_internet'")
-        ]
-        
-        for key, cmd in network_commands:
-            result = self.executor.execute(cmd)
-            if result.allowed and result.exit_code == 0:
-                env_info["network_info"][key] = result.stdout.strip()
-        
-        # User and permission context
-        user_commands = [
-            ("current_user", "whoami"),
-            ("user_id", "id"),
-            ("sudo_access", "sudo -n true 2>/dev/null && echo 'has_sudo' || echo 'no_sudo'"),
-            ("home_directory", "echo $HOME"),
-            ("current_directory", "pwd"),
-            ("shell", "echo $SHELL")
-        ]
-        
-        for key, cmd in user_commands:
-            result = self.executor.execute(cmd)
-            if result.allowed and result.exit_code == 0:
-                env_info["user_context"][key] = result.stdout.strip()
-        
-        # Filesystem information
-        fs_commands = [
-            ("mount_points", "mount | head -10"),
-            ("filesystem_types", "df -T"),
-            ("disk_usage_summary", "du -sh /var /tmp /home 2>/dev/null | head -5")
-        ]
-        
-        for key, cmd in fs_commands:
-            result = self.executor.execute(cmd)
-            if result.allowed and result.exit_code == 0:
-                env_info["filesystem_info"][key] = result.stdout.strip()
-        
-        # Save to cache for future use
-        self._save_environment_cache(env_info)
-        
-        return env_info
+            
+            # Save to cache for future use
+            logger.info("Saving environment information to cache...")
+            self._save_environment_cache(env_info)
+            
+            logger.info(f"Environment collection completed. Found {len(env_info)} categories")
+            return env_info
+            
+        except Exception as e:
+            logger.error(f"Critical error during environment collection: {e}")
+            logger.exception("Full traceback:")
+            # Return minimal safe structure
+            return {
+                "distribution": {"error": f"collection_failed: {str(e)}"},
+                "package_manager": {},
+                "available_tools": {},
+                "system_resources": {},
+                "network_info": {},
+                "user_context": {},
+                "filesystem_info": {}
+            }
     
     def _should_invalidate_cache(self, task_description: str) -> bool:
         """Determine if a task might change system state and require cache invalidation"""

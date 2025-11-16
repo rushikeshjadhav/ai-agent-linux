@@ -298,7 +298,7 @@ class SSHAgentCLI:
     def interactive_session(self):
         """Run interactive session"""
         print("🎮 Interactive mode - Enter tasks or commands")
-        print("Commands: 'health', 'context', 'mode <ro|rw|smart>', 'quit'")
+        print("Commands: 'health', 'context', 'mode <ro|rw|smart>', 'cache-status', 'cache-clear', 'quit'")
         
         while True:
             try:
@@ -338,6 +338,56 @@ class SSHAgentCLI:
                     print("📊 Server Context:")
                     print(self.agent.get_context_summary())
                 
+                elif task.lower() == 'cache-status':
+                    if not (os.getenv("OPENAI_API_KEY") or os.getenv("OPENROUTER_API_KEY") or os.getenv("ANTHROPIC_API_KEY")):
+                        print("❌ Cache status check requires an LLM API key (OPENAI_API_KEY, OPENROUTER_API_KEY, or ANTHROPIC_API_KEY)")
+                        continue
+                    
+                    try:
+                        from datetime import datetime
+                        # Check cache status on remote server
+                        cache_file = "/tmp/ssh_agent_env_cache.json"
+                        check_result = self.agent.execute_command(f"test -f {cache_file} && stat -c '%Y %s' {cache_file} || echo 'missing'")
+                        
+                        if check_result.allowed and check_result.exit_code == 0:
+                            if "missing" in check_result.stdout:
+                                print("📦 Environment Cache Status: Not found")
+                            else:
+                                try:
+                                    timestamp_str, size_str = check_result.stdout.strip().split()
+                                    cache_timestamp = int(timestamp_str)
+                                    cache_size = int(size_str)
+                                    current_time = int(datetime.now().timestamp())
+                                    age_minutes = (current_time - cache_timestamp) / 60
+                                    
+                                    print(f"📦 Environment Cache Status:")
+                                    print(f"   📅 Age: {age_minutes:.1f} minutes")
+                                    print(f"   📏 Size: {cache_size} bytes")
+                                    print(f"   📍 Location: {cache_file}")
+                                    
+                                    if age_minutes > 30:
+                                        print(f"   ⚠️  Cache is old (>30 minutes)")
+                                    else:
+                                        print(f"   ✅ Cache is fresh")
+                                        
+                                except (ValueError, IndexError):
+                                    print("📦 Environment Cache Status: Found but invalid format")
+                        else:
+                            print(f"❌ Could not check cache status: {check_result.stderr}")
+                            
+                    except Exception as e:
+                        print(f"❌ Error checking cache status: {e}")
+
+                elif task.lower() == 'cache-clear':
+                    try:
+                        result = self.agent.execute_command("rm -f /tmp/ssh_agent_env_cache.json")
+                        if result.allowed and result.exit_code == 0:
+                            print("🗑️ Environment cache cleared from remote server")
+                        else:
+                            print(f"❌ Failed to clear cache: {result.stderr}")
+                    except Exception as e:
+                        print(f"❌ Error clearing cache: {e}")
+                
                 elif task.lower().startswith('mode '):
                     mode_str = task.split(' ', 1)[1].lower()
                     if mode_str == 'ro':
@@ -359,7 +409,25 @@ class SSHAgentCLI:
                 print("\n⏹️ Interrupted")
                 break
             except Exception as e:
-                print(f"❌ Error: {e}")
+                logger.error(f"Task execution failed: {e}")
+                logger.exception("Full traceback:")
+                print(f"❌ Unexpected error: {e}")
+                print(f"📍 Error type: {type(e).__name__}")
+                print(f"📄 Check logs for full details")
+                
+                # Try to provide more context
+                if hasattr(e, '__cause__') and e.__cause__:
+                    print(f"🔗 Caused by: {e.__cause__}")
+                
+                # If it's a specific type of error, provide guidance
+                if "NoneType" in str(e):
+                    print("💡 This appears to be a data structure issue. The agent may have received unexpected data.")
+                    print("   Try running the command again or check your connection.")
+                elif "JSON" in str(e):
+                    print("💡 This appears to be a response parsing issue. The LLM may have returned malformed data.")
+                    print("   Try running the command again or check your API key.")
+                elif "connection" in str(e).lower():
+                    print("💡 This appears to be a connection issue. Check your network and SSH connection.")
     
     def run(self, args):
         """Main execution flow"""
