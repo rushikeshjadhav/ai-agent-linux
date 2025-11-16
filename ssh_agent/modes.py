@@ -5,6 +5,7 @@ import re
 class AgentMode(Enum):
     READ_ONLY = "ro"
     READ_WRITE = "rw"
+    INTELLIGENT = "smart"
 
 class CommandValidator:
     """Validates commands based on agent mode"""

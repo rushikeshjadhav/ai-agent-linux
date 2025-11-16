@@ -82,3 +82,15 @@ class CommandExecutor:
                 allowed=True,
                 reason=f"Execution error: {str(e)}"
             )
+    
+    def execute_with_context(self, command: str, context: dict = None, timeout: int = 30) -> CommandResult:
+        """Execute command with LLM context analysis"""
+        # For now, this is the same as regular execute
+        # In the future, we could use context to modify command behavior
+        result = self.execute(command, timeout)
+        
+        # Log context information if provided
+        if context:
+            logger.debug(f"Command executed with context: {context}")
+        
+        return result
