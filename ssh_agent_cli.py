@@ -171,17 +171,13 @@ class SSHAgentCLI:
         
         # Determine connection method
         if args and hasattr(args, 'key') and args.key:
-            # Use specified SSH key
+            # Use specified SSH key (assume no passphrase for CLI usage)
             key_path = Path(args.key).expanduser()
             if not key_path.exists():
                 print(f"❌ SSH key not found: {key_path}")
                 return False
             
-            passphrase = None
-            if input(f"Does {key_path.name} have a passphrase? (y/N): ").lower().startswith('y'):
-                passphrase = getpass.getpass("Enter passphrase: ")
-            
-            success = self.agent.connect_with_key(key_path, passphrase)
+            success = self.agent.connect_with_key(key_path, None)
             
         elif args and hasattr(args, 'password') and args.password:
             # Use password authentication
