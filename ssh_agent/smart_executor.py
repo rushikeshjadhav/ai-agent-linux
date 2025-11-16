@@ -791,6 +791,128 @@ class SmartExecutor:
         else:
             return "unknown"
     
+    def _create_enhanced_failure_context(self, result: CommandResult, step: Dict[str, Any], 
+                                       original_goal: str, previous_results: List[CommandResult]) -> Dict[str, Any]:
+        """Create comprehensive failure context for LLM analysis"""
+        command = step.get("command", "") if isinstance(step, dict) else str(step)
+        description = step.get("description", "") if isinstance(step, dict) else ""
+        
+        # Analyze missing information patterns
+        missing_info_analysis = {
+            "missing_parameters": self._detect_missing_parameters(result.command, result.stderr),
+            "incomplete_command": self._is_incomplete_command(result.command, result.stderr),
+            "requires_generation": self._requires_auto_generation(result.command, result.stderr)
+        }
+        
+        # Get previous context from earlier commands
+        previous_context = {}
+        for prev_result in previous_results[-5:]:  # Last 5 commands for context
+            if prev_result.exit_code == 0:
+                previous_context[prev_result.command] = {
+                    "stdout": prev_result.stdout[:200],
+                    "success": True
+                }
+        
+        return {
+            "step_description": description,
+            "failure_details": {
+                "command": result.command,
+                "exit_code": result.exit_code,
+                "stderr": result.stderr,
+                "stdout": result.stdout
+            },
+            "missing_info_analysis": missing_info_analysis,
+            "previous_context": previous_context,
+            "original_goal": original_goal
+        }
+    
+    def _detect_missing_parameters(self, command: str, stderr: str) -> List[str]:
+        """Detect what parameters are missing from a command"""
+        missing_params = []
+        
+        # Common patterns for missing parameters
+        patterns = [
+            ("password", ["password required", "password:", "enter password"]),
+            ("username", ["username required", "user not specified"]),
+            ("filename", ["file not specified", "no input file"]),
+            ("port", ["port required", "no port specified"]),
+            ("key", ["key required", "no key specified"])
+        ]
+        
+        stderr_lower = stderr.lower()
+        for param, error_patterns in patterns:
+            if any(pattern in stderr_lower for pattern in error_patterns):
+                missing_params.append(param)
+        
+        return missing_params
+    
+    def _is_incomplete_command(self, command: str, stderr: str) -> bool:
+        """Check if command appears to be incomplete"""
+        incomplete_indicators = [
+            "incomplete command",
+            "missing argument",
+            "expected argument",
+            "usage:",
+            "try --help"
+        ]
+        
+        return any(indicator in stderr.lower() for indicator in incomplete_indicators)
+    
+    def _requires_auto_generation(self, command: str, stderr: str) -> List[str]:
+        """Determine what values need to be auto-generated"""
+        generation_needed = []
+        
+        # Commands that commonly need generated values
+        if "passwd" in command and "password" not in command:
+            generation_needed.append("password")
+        
+        if "useradd" in command and "password" not in stderr.lower():
+            generation_needed.append("password")
+        
+        if "openssl" in command and "genrsa" in command:
+            generation_needed.append("secure_key")
+        
+        if "backup" in command.lower() and not any(char.isdigit() for char in command):
+            generation_needed.append("timestamp")
+        
+        return generation_needed
+    
+    def _generate_missing_information(self, info_type: str, context: Dict[str, Any]) -> str:
+        """Generate missing information based on type"""
+        import secrets
+        import string
+        from datetime import datetime
+        
+        if info_type in ["password", "<password>", "{password}"]:
+            # Generate secure password
+            alphabet = string.ascii_letters + string.digits + "!@#$%^&*"
+            return ''.join(secrets.choice(alphabet) for _ in range(16))
+        
+        elif info_type in ["random_string", "<random_string>", "{random_string}"]:
+            # Generate random alphanumeric string
+            return ''.join(secrets.choice(string.ascii_letters + string.digits) for _ in range(12))
+        
+        elif info_type in ["timestamp", "<timestamp>", "{timestamp}"]:
+            # Generate timestamp
+            return datetime.now().strftime("%Y%m%d_%H%M%S")
+        
+        elif info_type in ["temp_file", "<temp_file>", "{temp_file}"]:
+            # Generate temporary filename
+            random_suffix = ''.join(secrets.choice(string.ascii_lowercase) for _ in range(8))
+            return f"tmp_{random_suffix}"
+        
+        elif info_type in ["secure_key", "<secure_key>", "{secure_key}"]:
+            # Generate secure key identifier
+            return ''.join(secrets.choice(string.ascii_letters + string.digits) for _ in range(32))
+        
+        elif info_type in ["random_port", "<random_port>", "{random_port}"]:
+            # Generate random port in safe range
+            return str(secrets.randbelow(10000) + 50000)  # 50000-59999
+        
+        else:
+            # Default to random string
+            return ''.join(secrets.choice(string.ascii_letters + string.digits) for _ in range(12))
+    
     def _detect_package_manager(self) -> Optional[str]:
         """Detect available package manager"""
         managers = ["apt-get", "yum", "dnf", "pacman"]
