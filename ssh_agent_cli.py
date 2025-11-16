@@ -241,36 +241,46 @@ class SSHAgentCLI:
             if result.error_message:
                 print(f"❌ Error: {result.error_message}")
             
-            # Show command results
+            # Show command results with safety checks
             if result.results:
                 print("\n📝 Command Results:")
                 for i, cmd_result in enumerate(result.results, 1):
+                    # Safety check - ensure cmd_result is not None
+                    if cmd_result is None:
+                        print(f"  {i}. ⚠️ Command result is None")
+                        continue
+                    
                     # Check if exit code was interpreted
-                    validation_info = getattr(cmd_result, 'validation_info', {})
+                    validation_info = getattr(cmd_result, 'validation_info', {}) or {}
                     exit_interpretation = validation_info.get('exit_interpretation', {})
                     treated_as_success = validation_info.get('treated_as_success', False)
                     
+                    # Safety check for command attribute
+                    command_text = getattr(cmd_result, 'command', 'Unknown command')
+                    exit_code = getattr(cmd_result, 'exit_code', -1)
+                    stderr = getattr(cmd_result, 'stderr', '')
+                    
                     if treated_as_success:
                         status = "ℹ️"  # Informational
-                        print(f"  {i}. {status} {cmd_result.command} (exit: {cmd_result.exit_code})")
+                        print(f"  {i}. {status} {command_text} (exit: {exit_code})")
                         print(f"     Info: {exit_interpretation.get('message', 'Informational exit code')}")
-                    elif cmd_result.exit_code == 0:
+                    elif exit_code == 0:
                         status = "✅"
-                        print(f"  {i}. {status} {cmd_result.command}")
+                        print(f"  {i}. {status} {command_text}")
                     else:
                         status = "❌"
-                        print(f"  {i}. {status} {cmd_result.command} (exit: {cmd_result.exit_code})")
-                        if cmd_result.stderr:
-                            print(f"     Error: {cmd_result.stderr[:100]}...")
+                        print(f"  {i}. {status} {command_text} (exit: {exit_code})")
+                        if stderr:
+                            print(f"     Error: {stderr[:100]}...")
                     
                     # Show auto-generated values if any
-                    if hasattr(cmd_result, 'validation_info') and cmd_result.validation_info:
-                        generated_values = cmd_result.validation_info.get('generated_values', {})
+                    if validation_info:
+                        generated_values = validation_info.get('generated_values', {})
                         if generated_values:
                             print(f"     🔧 Auto-generated: {', '.join(generated_values.keys())}")
                         
-                        generated_command = cmd_result.validation_info.get('generated_command', '')
-                        if generated_command and generated_command != cmd_result.command:
+                        generated_command = validation_info.get('generated_command', '')
+                        if generated_command and generated_command != command_text:
                             print(f"     🔄 Corrected to: {generated_command}")
             
             # Show skipped steps if any
@@ -282,10 +292,12 @@ class SSHAgentCLI:
             
             # Show auto-generation summary
             auto_generated_items = []
-            for cmd_result in result.results:
-                if hasattr(cmd_result, 'validation_info'):
-                    generated_values = cmd_result.validation_info.get('generated_values', {})
-                    auto_generated_items.extend(generated_values.keys())
+            if result.results:
+                for cmd_result in result.results:
+                    if cmd_result is not None and hasattr(cmd_result, 'validation_info'):
+                        validation_info = getattr(cmd_result, 'validation_info', {}) or {}
+                        generated_values = validation_info.get('generated_values', {})
+                        auto_generated_items.extend(generated_values.keys())
             
             if auto_generated_items:
                 print(f"\n🎲 Auto-generated: {', '.join(set(auto_generated_items))}")
