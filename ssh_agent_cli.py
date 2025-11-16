@@ -155,12 +155,16 @@ class SSHAgentCLI:
             llm_provider = LLMProvider.OPENAI
             llm_api_key = os.getenv("OPENAI_API_KEY")
             print("🤖 Using OpenAI for LLM features")
+        elif os.getenv("OPENROUTER_API_KEY"):
+            llm_provider = LLMProvider.OPENROUTER
+            llm_api_key = os.getenv("OPENROUTER_API_KEY")
+            print("🤖 Using OpenRouter for LLM features")
         elif os.getenv("ANTHROPIC_API_KEY"):
             llm_provider = LLMProvider.ANTHROPIC
             llm_api_key = os.getenv("ANTHROPIC_API_KEY")
             print("🤖 Using Anthropic for LLM features")
         elif mode == AgentMode.INTELLIGENT:
-            print("⚠️ Warning: No LLM API key found. Set OPENAI_API_KEY or ANTHROPIC_API_KEY for full intelligent features.")
+            print("⚠️ Warning: No LLM API key found. Set OPENAI_API_KEY, OPENROUTER_API_KEY, or ANTHROPIC_API_KEY for full intelligent features.")
             print("🔄 Falling back to OpenAI provider (will fail without API key)")
             llm_provider = LLMProvider.OPENAI
         
@@ -279,8 +283,8 @@ class SSHAgentCLI:
                     break
                 
                 elif task.lower() == 'health':
-                    if not (os.getenv("OPENAI_API_KEY") or os.getenv("ANTHROPIC_API_KEY")):
-                        print("❌ Health analysis requires an LLM API key (OPENAI_API_KEY or ANTHROPIC_API_KEY)")
+                    if not (os.getenv("OPENAI_API_KEY") or os.getenv("OPENROUTER_API_KEY") or os.getenv("ANTHROPIC_API_KEY")):
+                        print("❌ Health analysis requires an LLM API key (OPENAI_API_KEY, OPENROUTER_API_KEY, or ANTHROPIC_API_KEY)")
                         continue
                     
                     print("🏥 Analyzing server health...")
@@ -374,6 +378,7 @@ Examples:
   
 Environment Variables:
   OPENAI_API_KEY      # For OpenAI LLM features
+  OPENROUTER_API_KEY  # For OpenRouter LLM features (access to multiple models)
   ANTHROPIC_API_KEY   # For Anthropic LLM features
         """
     )

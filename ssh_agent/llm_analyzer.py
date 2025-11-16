@@ -21,6 +21,7 @@ logger = logging.getLogger(__name__)
 class LLMProvider(Enum):
     OPENAI = "openai"
     ANTHROPIC = "anthropic"
+    OPENROUTER = "openrouter"
 
 @dataclass
 class AnalysisResult:
@@ -53,6 +54,11 @@ class ServerStateAnalyzer:
         """Initialize LLM client"""
         if self.provider == LLMProvider.OPENAI and HAS_OPENAI:
             self._client = openai.OpenAI(api_key=self.api_key)
+        elif self.provider == LLMProvider.OPENROUTER and HAS_OPENAI:
+            self._client = openai.OpenAI(
+                api_key=self.api_key,
+                base_url="https://openrouter.ai/api/v1"
+            )
         elif self.provider == LLMProvider.ANTHROPIC and HAS_ANTHROPIC:
             self._client = anthropic.Anthropic(api_key=self.api_key)
         else:
@@ -204,6 +210,17 @@ class ServerStateAnalyzer:
         if self.provider == LLMProvider.OPENAI and HAS_OPENAI:
             response = self._client.chat.completions.create(
                 model="gpt-4",
+                messages=[
+                    {"role": "system", "content": "You are a Linux system administrator expert. Provide accurate, safe advice."},
+                    {"role": "user", "content": prompt}
+                ],
+                temperature=0.1
+            )
+            return response.choices[0].message.content
+        
+        elif self.provider == LLMProvider.OPENROUTER and HAS_OPENAI:
+            response = self._client.chat.completions.create(
+                model="anthropic/claude-3.5-sonnet",  # Default to Claude 3.5 Sonnet via OpenRouter
                 messages=[
                     {"role": "system", "content": "You are a Linux system administrator expert. Provide accurate, safe advice."},
                     {"role": "user", "content": prompt}
