@@ -3,6 +3,7 @@ from .modes import AgentMode
 from .executor import CommandResult
 from .llm_analyzer import ServerStateAnalyzer, AnalysisResult, LLMProvider
 from .smart_executor import TaskResult, ServiceResult, PackageResult
+from .enhanced_executor import EnhancedTaskResult
 
 __all__ = [
     'SSHAgent', 
@@ -13,5 +14,6 @@ __all__ = [
     'LLMProvider',
     'TaskResult',
     'ServiceResult',
-    'PackageResult'
+    'PackageResult',
+    'EnhancedTaskResult'
 ]

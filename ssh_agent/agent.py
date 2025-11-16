@@ -7,6 +7,7 @@ from .modes import AgentMode
 from .llm_analyzer import ServerStateAnalyzer, AnalysisResult, LLMProvider
 from .context_manager import ServerContext
 from .smart_executor import SmartExecutor, TaskResult, ServiceResult, PackageResult
+from .enhanced_executor import EnhancedExecutor, EnhancedTaskResult
 
 logger = logging.getLogger(__name__)
 
@@ -25,6 +26,7 @@ class SSHAgent:
         self.analyzer = ServerStateAnalyzer(llm_provider, llm_api_key)
         self.context = ServerContext()
         self.smart_executor: Optional[SmartExecutor] = None
+        self.enhanced_executor: Optional[EnhancedExecutor] = None
         self.connected = False
     
     def connect_with_key(self, key_path: Union[str, Path], passphrase: Optional[str] = None) -> bool:
@@ -33,6 +35,7 @@ class SSHAgent:
         if success:
             self.executor = CommandExecutor(self.connection, self.mode)
             self.smart_executor = SmartExecutor(self.executor, self.analyzer, self.context)
+            self.enhanced_executor = EnhancedExecutor(self.executor, self.analyzer, self.context)
             self.connected = True
         return success
     
@@ -42,6 +45,7 @@ class SSHAgent:
         if success:
             self.executor = CommandExecutor(self.connection, self.mode)
             self.smart_executor = SmartExecutor(self.executor, self.analyzer, self.context)
+            self.enhanced_executor = EnhancedExecutor(self.executor, self.analyzer, self.context)
             self.connected = True
         return success
     
@@ -67,6 +71,7 @@ class SSHAgent:
         if self.executor:
             self.executor = CommandExecutor(self.connection, self.mode)
             self.smart_executor = SmartExecutor(self.executor, self.analyzer, self.context)
+            self.enhanced_executor = EnhancedExecutor(self.executor, self.analyzer, self.context)
         logger.info(f"Agent mode changed to {mode.value}")
     
     def analyze_server_health(self) -> AnalysisResult:
@@ -155,6 +160,24 @@ class SSHAgent:
         
         return self.smart_executor.manage_packages(packages, action)
     
+    def execute_enhanced_task(self, goal: str, auto_approve: bool = False, 
+                             human_callback: Optional[callable] = None) -> EnhancedTaskResult:
+        """Execute task with full safeguards, retries, and human escalation"""
+        if not self.connected or not self.enhanced_executor:
+            return EnhancedTaskResult(
+                task_description=goal,
+                final_success=False,
+                total_attempts=0,
+                execution_phases=[],
+                attempts=[],
+                snapshots=[],
+                human_escalation_required=False,
+                rollback_performed=False,
+                final_message="Agent not connected"
+            )
+        
+        return self.enhanced_executor.execute_enhanced_task(goal, auto_approve, human_callback)
+    
     def get_context_summary(self) -> str:
         """Get a summary of current server context"""
         return self.context.get_context_summary()
@@ -164,6 +187,7 @@ class SSHAgent:
         self.connection.disconnect()
         self.executor = None
         self.smart_executor = None
+        self.enhanced_executor = None
         self.connected = False
     
     def __enter__(self):
