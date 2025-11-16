@@ -206,7 +206,7 @@ class ServerStateAnalyzer:
             )
     
     def validate_action_plan(self, actions: List[str], current_state: Dict[str, Any]) -> Dict[str, Any]:
-        """Use LLM to validate if proposed actions are safe/appropriate"""
+        """Use LLM to validate if proposed actions are safe/appropriate with robust parsing"""
         if not self._client:
             return {
                 "safe": False,
@@ -232,12 +232,25 @@ class ServerStateAnalyzer:
         3. What are the potential risks?
         4. Any missing safety checks?
         
-        Respond in JSON format with keys: safe (boolean), reason (string), risks (array), confidence (float 0.0-1.0)
+        CRITICAL: Respond with ONLY valid JSON, no additional text.
+        
+        {{
+            "safe": true,
+            "reason": "explanation",
+            "risks": ["list of risks"],
+            "confidence": 0.8
+        }}
         """
         
         try:
             response = self._call_llm(prompt)
-            return json.loads(response)
+            fallback = {
+                "safe": False,
+                "reason": "Validation parsing failed",
+                "risks": ["Could not parse validation response"],
+                "confidence": 0.0
+            }
+            return self._robust_json_parse(response, fallback)
         except Exception as e:
             logger.error(f"Action validation failed: {e}")
             return {
@@ -257,11 +270,13 @@ class ServerStateAnalyzer:
     
     def _call_llm(self, prompt: str) -> str:
         """Call the configured LLM provider"""
+        system_message = "You are a Linux system administrator expert. Provide accurate, safe advice. ALWAYS respond with valid JSON only, no additional text or explanations outside the JSON structure."
+        
         if self.provider == LLMProvider.OPENAI and HAS_OPENAI:
             response = self._client.chat.completions.create(
                 model="gpt-4",
                 messages=[
-                    {"role": "system", "content": "You are a Linux system administrator expert. Provide accurate, safe advice."},
+                    {"role": "system", "content": system_message},
                     {"role": "user", "content": prompt}
                 ],
                 temperature=0.1
@@ -272,7 +287,7 @@ class ServerStateAnalyzer:
             response = self._client.chat.completions.create(
                 model="anthropic/claude-3.5-sonnet",  # Default to Claude 3.5 Sonnet via OpenRouter
                 messages=[
-                    {"role": "system", "content": "You are a Linux system administrator expert. Provide accurate, safe advice."},
+                    {"role": "system", "content": system_message},
                     {"role": "user", "content": prompt}
                 ],
                 temperature=0.1
@@ -284,7 +299,7 @@ class ServerStateAnalyzer:
                 model="claude-3-sonnet-20240229",
                 max_tokens=2000,
                 messages=[
-                    {"role": "user", "content": prompt}
+                    {"role": "user", "content": f"{system_message}\n\n{prompt}"}
                 ]
             )
             return response.content[0].text
@@ -293,25 +308,24 @@ class ServerStateAnalyzer:
             raise Exception("No LLM provider available")
     
     def _parse_analysis_response(self, response: str) -> AnalysisResult:
-        """Parse LLM analysis response"""
-        try:
-            data = json.loads(response)
-            return AnalysisResult(
-                summary=data.get("summary", ""),
-                issues=data.get("issues", []),
-                recommendations=data.get("recommendations", []),
-                severity=data.get("severity", "unknown"),
-                confidence=float(data.get("confidence", 0.0))
-            )
-        except Exception as e:
-            logger.error(f"Failed to parse analysis response: {e}")
-            return AnalysisResult(
-                summary="Failed to parse LLM response",
-                issues=[],
-                recommendations=[],
-                severity="unknown",
-                confidence=0.0
-            )
+        """Parse LLM analysis response with robust error handling"""
+        fallback = {
+            "summary": "Failed to parse LLM response",
+            "issues": [],
+            "recommendations": [],
+            "severity": "unknown",
+            "confidence": 0.0
+        }
+        
+        data = self._robust_json_parse(response, fallback)
+        
+        return AnalysisResult(
+            summary=data.get("summary", ""),
+            issues=data.get("issues", []),
+            recommendations=data.get("recommendations", []),
+            severity=data.get("severity", "unknown"),
+            confidence=float(data.get("confidence", 0.0))
+        )
     
     def analyze_command_failure(self, command: str, exit_code: int, stderr: str, 
                                system_state: Dict[str, Any]) -> Dict[str, Any]:
@@ -385,51 +399,49 @@ class ServerStateAnalyzer:
             )
     
     def _parse_action_plan_with_placeholders(self, response: str) -> ActionPlan:
-        """Parse LLM action plan response with placeholder support"""
-        try:
-            data = json.loads(response)
-            
-            # Process steps to ensure they have the required fields
-            processed_steps = []
-            for step in data.get("steps", []):
-                if isinstance(step, dict):
-                    # Ensure all required fields exist
-                    processed_step = {
-                        "command": step.get("command", ""),
-                        "description": step.get("description", ""),
-                        "prerequisite_check": step.get("prerequisite_check", ""),
-                        "safety_check": step.get("safety_check", ""),
-                        "auto_generate": step.get("auto_generate", []),
-                        "success_verification": step.get("success_verification", "")
-                    }
-                    processed_steps.append(processed_step)
-                else:
-                    # Convert string steps to dict format
-                    processed_steps.append({
-                        "command": str(step),
-                        "description": str(step),
-                        "prerequisite_check": "",
-                        "safety_check": "",
-                        "auto_generate": [],
-                        "success_verification": ""
-                    })
-            
-            return ActionPlan(
-                goal=data.get("goal", ""),
-                steps=processed_steps,
-                risks=data.get("risks", []),
-                estimated_time=data.get("estimated_time", "unknown"),
-                safety_score=float(data.get("safety_score", 0.0))
-            )
-        except Exception as e:
-            logger.error(f"Failed to parse enhanced action plan: {e}")
-            return ActionPlan(
-                goal="Failed to parse plan",
-                steps=[],
-                risks=[f"Parse error: {str(e)}"],
-                estimated_time="unknown",
-                safety_score=0.0
-            )
+        """Parse LLM action plan response with placeholder support and robust error handling"""
+        fallback = {
+            "goal": "Failed to parse plan",
+            "steps": [],
+            "risks": ["Parse error"],
+            "estimated_time": "unknown",
+            "safety_score": 0.0
+        }
+        
+        data = self._robust_json_parse(response, fallback)
+        
+        # Process steps to ensure they have the required fields
+        processed_steps = []
+        for step in data.get("steps", []):
+            if isinstance(step, dict):
+                # Ensure all required fields exist
+                processed_step = {
+                    "command": step.get("command", ""),
+                    "description": step.get("description", ""),
+                    "prerequisite_check": step.get("prerequisite_check", ""),
+                    "safety_check": step.get("safety_check", ""),
+                    "auto_generate": step.get("auto_generate", []),
+                    "success_verification": step.get("success_verification", "")
+                }
+                processed_steps.append(processed_step)
+            else:
+                # Convert string steps to dict format
+                processed_steps.append({
+                    "command": str(step),
+                    "description": str(step),
+                    "prerequisite_check": "",
+                    "safety_check": "",
+                    "auto_generate": [],
+                    "success_verification": ""
+                })
+        
+        return ActionPlan(
+            goal=data.get("goal", ""),
+            steps=processed_steps,
+            risks=data.get("risks", []),
+            estimated_time=data.get("estimated_time", "unknown"),
+            safety_score=float(data.get("safety_score", 0.0))
+        )
     
     def analyze_command_for_missing_info(self, command: str, error_output: str, 
                                        system_context: Dict[str, Any]) -> Dict[str, Any]:
@@ -474,7 +486,8 @@ class ServerStateAnalyzer:
         - "mysql -p" → "mysql -p<password>"
         - "openssl genrsa" → "openssl genrsa -out key_<timestamp>.pem 2048"
         
-        Respond in JSON format:
+        CRITICAL: Respond with ONLY valid JSON, no additional text or explanations.
+        
         {{
             "missing_info": ["list of missing information types"],
             "corrected_command": "command with placeholders",
@@ -486,12 +499,72 @@ class ServerStateAnalyzer:
         
         try:
             response = self._call_llm(prompt)
-            return json.loads(response)
+            # Clean the response to extract only the JSON part
+            cleaned_response = self._extract_json_from_response(response)
+            return json.loads(cleaned_response)
         except Exception as e:
             logger.error(f"Command analysis failed: {e}")
             return {
                 "missing_info": [],
                 "corrected_command": command,
                 "auto_generate": [],
+                "explanation": f"Analysis failed: {str(e)}",
                 "confidence": 0.0
             }
+    
+    def _extract_json_from_response(self, response: str) -> str:
+        """Extract JSON from LLM response that might contain extra text"""
+        try:
+            # Try to find JSON object boundaries
+            start_idx = response.find('{')
+            if start_idx == -1:
+                raise ValueError("No JSON object found in response")
+            
+            # Find the matching closing brace
+            brace_count = 0
+            end_idx = start_idx
+            
+            for i, char in enumerate(response[start_idx:], start_idx):
+                if char == '{':
+                    brace_count += 1
+                elif char == '}':
+                    brace_count -= 1
+                    if brace_count == 0:
+                        end_idx = i + 1
+                        break
+            
+            if brace_count != 0:
+                raise ValueError("Unmatched braces in JSON response")
+            
+            json_str = response[start_idx:end_idx]
+            
+            # Validate that it's proper JSON
+            json.loads(json_str)  # This will raise an exception if invalid
+            
+            return json_str
+            
+        except Exception as e:
+            logger.warning(f"Failed to extract JSON from response: {e}")
+            # Return a fallback JSON structure
+            return json.dumps({
+                "missing_info": [],
+                "corrected_command": "echo 'JSON extraction failed'",
+                "auto_generate": [],
+                "explanation": f"Failed to parse LLM response: {str(e)}",
+                "confidence": 0.0
+            })
+    
+    def _robust_json_parse(self, response: str, fallback_data: Dict[str, Any]) -> Dict[str, Any]:
+        """Robustly parse JSON response with fallback"""
+        try:
+            # First try direct parsing
+            return json.loads(response)
+        except json.JSONDecodeError:
+            try:
+                # Try extracting JSON from response
+                cleaned_response = self._extract_json_from_response(response)
+                return json.loads(cleaned_response)
+            except Exception as e:
+                logger.warning(f"Failed to parse JSON response: {e}")
+                logger.debug(f"Raw response: {response[:500]}...")
+                return fallback_data
