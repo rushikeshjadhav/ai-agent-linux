@@ -939,6 +939,57 @@ class SmartExecutor:
                     "continue_execution": True
                 }
         
+        # System state checks - be more specific about systemctl failures
+        if "systemctl" in command:
+            if exit_code == 1:
+                # Check if this is a systemd not functional error
+                if any(error in stderr.lower() for error in [
+                    "system has not been booted with systemd",
+                    "failed to connect to bus",
+                    "can't operate"
+                ]):
+                    return {
+                        "is_error": True,
+                        "interpretation": "systemd_not_functional",
+                        "message": "systemd is not functional in this environment",
+                        "continue_execution": False
+                    }
+                elif "systemctl is-enabled" in command:
+                    return {
+                        "is_error": False,
+                        "interpretation": "service_disabled",
+                        "message": "Service is disabled (normal state check)",
+                        "continue_execution": True
+                    }
+                else:
+                    return {
+                        "is_error": True,
+                        "interpretation": "systemd_not_functional",
+                        "message": "systemctl command failed - systemd may not be functional",
+                        "continue_execution": False
+                    }
+            elif exit_code == 3 and "systemctl is-active" in command:
+                return {
+                    "is_error": False,
+                    "interpretation": "service_inactive",
+                    "message": "Service is inactive (normal state check)",
+                    "continue_execution": True
+                }
+            elif exit_code == 4:
+                return {
+                    "is_error": False,
+                    "interpretation": "service_not_found",
+                    "message": "Service not found",
+                    "continue_execution": True
+                }
+            elif exit_code == 5:
+                return {
+                    "is_error": True,
+                    "interpretation": "service_not_found",
+                    "message": "Service not found",
+                    "continue_execution": False
+                }
+        
         # Check stderr for additional context
         if stderr:
             stderr_lower = stderr.lower()
@@ -1132,17 +1183,25 @@ class SmartExecutor:
         # ENHANCED SYSTEMD DETECTION - Check both availability AND functionality
         systemd_status = container_info.get("systemd_available", "")
         systemd_running = container_info.get("systemd_running", "")
+        systemd_functional = container_info.get("systemd_functional", "")
+        systemd_pid1 = container_info.get("systemd_pid1", "")
         
         if "no_systemd" in systemd_status:
             limitations.append("no_systemd")
         elif "systemd_available" in systemd_status:
             # systemctl command exists, but check if it's functional
-            if any(error_msg in systemd_running.lower() for error_msg in [
+            systemd_errors = [
                 "system has not been booted with systemd",
                 "can't operate",
                 "failed to connect to bus",
-                "systemd_not_running"
-            ]):
+                "systemd_not_running",
+                "failed to get d-bus connection",
+                "systemd_not_functional"
+            ]
+            
+            if any(error_msg in systemd_running.lower() for error_msg in systemd_errors) or \
+               any(error_msg in systemd_functional.lower() for error_msg in systemd_errors) or \
+               "systemd_not_pid1" in systemd_pid1:
                 limitations.append("no_systemd")
                 logger.info("systemctl command exists but systemd is not functional - treating as no_systemd")
             elif is_container:
