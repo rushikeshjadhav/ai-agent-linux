@@ -1562,10 +1562,38 @@ class SmartExecutor:
         if result.exit_code == 0:
             return {"continue": True, "reason": "Command succeeded", "step_achieved": True}
         
-        # Check for common "already exists" scenarios
+        # CRITICAL STEP ANALYSIS - Check if this is a blocking failure
+        critical_failure_patterns = [
+            # Package installation failures
+            ("install", ["no package", "unable to locate", "package not found", "nothing to do"]),
+            # Service start failures  
+            ("start", ["failed to start", "job failed", "unit not found"]),
+            # Download/fetch failures
+            ("download", ["failed to download", "connection failed", "not found"]),
+            # Permission failures that can't be easily fixed
+            ("permission", ["permission denied", "access denied"] if "sudo" in command else [])
+        ]
+        
+        command_lower = command.lower()
+        stderr_lower = result.stderr.lower()
+        
+        # Check for critical failures that should trigger replanning
+        for failure_type, error_patterns in critical_failure_patterns:
+            if failure_type in command_lower:
+                if any(pattern in stderr_lower for pattern in error_patterns):
+                    logger.warning(f"Critical {failure_type} failure detected: {result.stderr[:100]}")
+                    return {
+                        "continue": False,
+                        "reason": f"Critical {failure_type} failure: {result.stderr[:100]}",
+                        "step_achieved": False,
+                        "critical_failure": True,
+                        "requires_replanning": True
+                    }
+        
+        # Check for common "already exists" scenarios (these can continue)
         already_exists_patterns = [
             ("user.*already exists", "user creation"),
-            ("group.*already exists", "group creation"),
+            ("group.*already exists", "group creation"), 
             ("file exists", "file creation"),
             ("directory.*exists", "directory creation"),
             ("package.*already.*installed", "package installation"),
@@ -1576,21 +1604,36 @@ class SmartExecutor:
             ("no change", "configuration change")
         ]
         
-        stderr_lower = result.stderr.lower()
         stdout_lower = result.stdout.lower()
         
         for pattern, operation_type in already_exists_patterns:
             if pattern in stderr_lower or pattern in stdout_lower:
                 logger.info(f"Step appears already completed: {operation_type}")
                 return {
-                    "continue": True, 
+                    "continue": True,
                     "reason": f"Step already completed: {operation_type}",
                     "step_achieved": True,
                     "skip_reason": f"Target already exists: {pattern}"
                 }
         
-        # For unclear failures, consult LLM
-        return self._consult_llm_for_step_validation(step, result, original_goal)
+        # For unclear failures, consult LLM but be more conservative
+        llm_validation = self._consult_llm_for_step_validation(step, result, original_goal)
+        
+        # Override LLM if it suggests continuing on what appears to be a critical failure
+        if llm_validation.get("continue", False):
+            # Double-check for installation/setup failures
+            if any(keyword in command_lower for keyword in ["install", "setup", "download", "fetch"]):
+                if any(error in stderr_lower for error in ["not found", "failed", "error", "unable"]):
+                    logger.warning("Overriding LLM suggestion - this appears to be a critical installation failure")
+                    return {
+                        "continue": False,
+                        "reason": f"Critical installation failure overriding LLM: {result.stderr[:100]}",
+                        "step_achieved": False,
+                        "critical_failure": True,
+                        "requires_replanning": True
+                    }
+        
+        return llm_validation
 
     def _consult_llm_for_step_validation(self, step: Dict[str, Any], result: CommandResult, 
                                        original_goal: str) -> Dict[str, Any]:
@@ -2217,8 +2260,45 @@ class SmartExecutor:
                 # First, try step validation to see if goal was achieved despite failure
                 validation = self._validate_step_completion(step, result, task_description)
                 
-                if validation.get("continue", False):
-                    # Step achieved goal despite failure - continue
+                # Check if this is explicitly marked as requiring replanning
+                if validation.get("requires_replanning", False) or validation.get("critical_failure", False):
+                    logger.info(f"Critical failure detected at step {i+1}, triggering immediate replanning...")
+                    
+                    # CRITICAL FAILURE - TRIGGER REPLANNING IMMEDIATELY
+                    replan_result = self._replan_remaining_steps(
+                        action_plan=action_plan,
+                        failed_step_index=i,
+                        failed_result=result,
+                        task_description=task_description,
+                        prerequisite_results=prerequisite_results,
+                        completed_steps=results[:i]  # Steps completed so far
+                    )
+                    
+                    if replan_result.get("success", False):
+                        # Replace remaining steps with replanned steps
+                        new_steps = replan_result.get("new_steps", [])
+                        logger.info(f"Replanning successful: replacing {len(action_plan.steps) - i} remaining steps with {len(new_steps)} new steps")
+                        
+                        # Update action plan with new steps
+                        action_plan.steps = action_plan.steps[:i] + new_steps
+                        
+                        # Continue execution with new plan
+                        continue
+                    else:
+                        # Replanning failed - this is a critical failure
+                        logger.error(f"Replanning failed: {replan_result.get('reason', 'Unknown reason')}")
+                        return TaskResult(
+                            task_description=task_description,
+                            success=False,
+                            steps_completed=completed_steps,
+                            total_steps=len(action_plan.steps),
+                            results=results,
+                            error_message=f"Critical failure with replanning failure: {replan_result.get('reason', result.stderr)}",
+                            skipped_steps=skipped_steps
+                        )
+
+                elif validation.get("continue", False):
+                    # Step achieved goal despite failure - continue normally
                     validation["prerequisite_context"] = prerequisite_basis
                     completed_steps += 1
                     
@@ -2236,40 +2316,17 @@ class SmartExecutor:
                             logger.warning("Corrected command also failed, but continuing based on validation")
                     
                     continue
-                
-                # CRITICAL FAILURE - TRIGGER REPLANNING
-                logger.info(f"Critical failure at step {i+1}, triggering replanning...")
-                
-                # Get replanning from LLM
-                replan_result = self._replan_remaining_steps(
-                    action_plan=action_plan,
-                    failed_step_index=i,
-                    failed_result=result,
-                    task_description=task_description,
-                    prerequisite_results=prerequisite_results,
-                    completed_steps=results[:i]  # Steps completed so far
-                )
-                
-                if replan_result.get("success", False):
-                    # Replace remaining steps with replanned steps
-                    new_steps = replan_result.get("new_steps", [])
-                    logger.info(f"Replanning successful: replacing {len(action_plan.steps) - i} remaining steps with {len(new_steps)} new steps")
-                    
-                    # Update action plan with new steps
-                    action_plan.steps = action_plan.steps[:i] + new_steps
-                    
-                    # Continue execution with new plan (the loop will continue from next iteration)
-                    continue
+
                 else:
-                    # Replanning failed - this is a critical failure
-                    logger.error(f"Replanning failed: {replan_result.get('reason', 'Unknown reason')}")
+                    # This is a failure that should stop execution
+                    logger.error(f"Critical failure at step {i+1}: {validation.get('reason', 'Unknown')}")
                     return TaskResult(
                         task_description=task_description,
                         success=False,
                         steps_completed=completed_steps,
                         total_steps=len(action_plan.steps),
                         results=results,
-                        error_message=f"Critical failure with replanning failure: {replan_result.get('reason', result.stderr)}",
+                        error_message=f"Critical failure: {validation.get('reason', result.stderr)}",
                         skipped_steps=skipped_steps
                     )
             else:
@@ -2663,6 +2720,20 @@ class SmartExecutor:
         - If package issues: use different package manager or manual installation
         - If file/directory issues: create prerequisites or use different paths
         - If network issues: check connectivity and use alternatives
+        
+        INSTALLATION FAILURE SPECIFIC STRATEGIES:
+        ========================================
+        - If package not found in repositories: try alternative package names, add repositories, or use manual installation
+        - If dnf/yum fails: try different package managers, download directly, or use alternative software
+        - If service installation fails: try different installation methods or alternative services
+        - If dependencies missing: install dependencies first, or find self-contained alternatives
+
+        CRITICAL FOR INSTALLATION FAILURES:
+        ===================================
+        - Do NOT proceed with configuration/startup steps if installation failed
+        - Find working installation method FIRST before any other steps
+        - Consider completely different software if original cannot be installed
+        - Use alternative approaches (Docker, manual compilation, different package) if needed
         
         CRITICAL REQUIREMENTS:
         =====================
