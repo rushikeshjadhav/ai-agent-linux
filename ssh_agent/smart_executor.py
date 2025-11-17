@@ -768,6 +768,32 @@ class SmartExecutor:
                     logger.debug(f"Failed to get filesystem info '{key}': {e}")
                     env_info["filesystem_info"][key] = f"error: {str(e)}"
             
+            # Container environment detection
+            container_commands = [
+                ("container_check", "cat /.dockerenv 2>/dev/null && echo 'docker' || echo 'not_docker'"),
+                ("cgroup_check", "cat /proc/1/cgroup 2>/dev/null | grep -E '(docker|lxc|containerd)' && echo 'container' || echo 'not_container'"),
+                ("init_process", "ps -p 1 -o comm= 2>/dev/null"),
+                ("systemd_available", "systemctl --version 2>/dev/null && echo 'systemd_available' || echo 'no_systemd'"),
+                ("kernel_modules", "lsmod 2>/dev/null | wc -l"),
+                ("proc_mounts", "cat /proc/mounts | grep -E '(overlay|aufs|devicemapper)' | head -3"),
+                ("virtualization", "systemd-detect-virt 2>/dev/null || echo 'unknown'")
+            ]
+
+            env_info["container_info"] = {}
+            for key, cmd in container_commands:
+                try:
+                    result = self.executor.execute(cmd)
+                    if result and result.allowed and result.exit_code == 0:
+                        env_info["container_info"][key] = result.stdout.strip()
+                    else:
+                        env_info["container_info"][key] = "unavailable"
+                except Exception as e:
+                    logger.debug(f"Failed to get container info '{key}': {e}")
+                    env_info["container_info"][key] = f"error: {str(e)}"
+
+            # Analyze container environment
+            env_info["environment_type"] = self._analyze_environment_type(env_info["container_info"])
+            
             # Validate env_info structure
             if not isinstance(env_info, dict):
                 logger.error("Environment info is not a dictionary!")
@@ -999,6 +1025,99 @@ class SmartExecutor:
                 "continue_execution": False
             }
 
+    def _analyze_environment_type(self, container_info: Dict[str, str]) -> Dict[str, Any]:
+        """Analyze if we're in a container and what type"""
+        is_container = False
+        container_type = "unknown"
+        limitations = []
+        
+        # Check for Docker
+        if "docker" in container_info.get("container_check", ""):
+            is_container = True
+            container_type = "docker"
+        
+        # Check cgroups
+        if "container" in container_info.get("cgroup_check", ""):
+            is_container = True
+            if container_type == "unknown":
+                container_type = "container"
+        
+        # Check init process
+        init_process = container_info.get("init_process", "")
+        if init_process in ["sh", "bash", "python", "node", "java"]:
+            is_container = True
+            limitations.append("no_init_system")
+        
+        # Check systemd availability
+        if "no_systemd" in container_info.get("systemd_available", ""):
+            limitations.append("no_systemd")
+        
+        # Check kernel module access
+        try:
+            module_count = int(container_info.get("kernel_modules", "0"))
+            if module_count < 10:  # Very few modules suggests container
+                limitations.append("limited_kernel_access")
+        except ValueError:
+            pass
+        
+        # Check for overlay filesystem (common in containers)
+        if any(fs in container_info.get("proc_mounts", "") for fs in ["overlay", "aufs", "devicemapper"]):
+            is_container = True
+        
+        # Check virtualization detection
+        virt_type = container_info.get("virtualization", "")
+        if virt_type in ["docker", "lxc", "container"]:
+            is_container = True
+            container_type = virt_type
+        
+        return {
+            "is_container": is_container,
+            "container_type": container_type,
+            "limitations": limitations,
+            "capabilities": self._assess_container_capabilities(limitations),
+            "recommended_alternatives": self._get_container_alternatives(limitations)
+        }
+
+    def _assess_container_capabilities(self, limitations: List[str]) -> Dict[str, bool]:
+        """Assess what capabilities are available in this environment"""
+        return {
+            "can_use_systemctl": "no_systemd" not in limitations,
+            "can_modify_kernel": "limited_kernel_access" not in limitations,
+            "can_use_firewall": "limited_kernel_access" not in limitations,
+            "can_install_packages": True,  # Usually possible in containers
+            "can_manage_users": True,      # Usually possible
+            "can_modify_network": "limited_kernel_access" not in limitations,
+            "has_init_system": "no_init_system" not in limitations
+        }
+
+    def _get_container_alternatives(self, limitations: List[str]) -> Dict[str, List[str]]:
+        """Get alternative approaches for container limitations"""
+        alternatives = {}
+        
+        if "no_systemd" in limitations:
+            alternatives["service_management"] = [
+                "Use process managers like supervisord",
+                "Start services directly with their binaries",
+                "Use container orchestration for service management",
+                "Check if service is running with ps/pgrep"
+            ]
+        
+        if "limited_kernel_access" in limitations:
+            alternatives["firewall_management"] = [
+                "Use application-level security",
+                "Configure firewall on container host",
+                "Use network policies in orchestration",
+                "Implement security in application code"
+            ]
+            
+            alternatives["network_management"] = [
+                "Use container networking features",
+                "Configure networking through orchestration",
+                "Use environment variables for network config"
+            ]
+        
+        return alternatives
+
     def _should_invalidate_cache(self, task_description: str) -> bool:
         """Determine if a task might change system state and require cache invalidation"""
         system_changing_keywords = [
@@ -1102,6 +1221,10 @@ class SmartExecutor:
         """Execute a single task attempt with prerequisite-informed planning"""
         logger.info("=== PHASE 1: Environment Collection ===")
         env_info = self._collect_comprehensive_environment_info()
+        
+        # Update context with environment type
+        if "environment_type" in env_info:
+            self.context.update_environment_type(env_info["environment_type"])
         
         logger.info("=== PHASE 2: Prerequisite Analysis ===")
         prerequisite_spec = self._collect_task_prerequisites(task_description, env_info)
@@ -2014,6 +2137,34 @@ class SmartExecutor:
                 logger.warning(f"Step {i+1} has no command, skipping")
                 continue
             
+            # Validate command for container environment
+            env_info = self.context.get_current_state().get("environment", {})
+            container_validation = self._validate_command_for_container(command, {"environment_type": env_info.get("environment_type", {})})
+            if not container_validation["allowed"]:
+                logger.warning(f"Command not suitable for container: {container_validation['reason']}")
+                
+                # Try to get alternative approach from LLM
+                alternative_result = self._get_container_alternative_command(
+                    command, description, container_validation, task_description
+                )
+                
+                if alternative_result.get("alternative_command"):
+                    logger.info(f"Using container alternative: {alternative_result['alternative_command']}")
+                    command = alternative_result["alternative_command"]
+                    description = f"{description} (container alternative)"
+                else:
+                    # Skip this step with explanation
+                    logger.info(f"Skipping container-incompatible step: {description}")
+                    skipped_steps.append({
+                        "step": i+1,
+                        "description": description,
+                        "reason": container_validation["reason"],
+                        "skip_reason": "Container environment limitation",
+                        "alternatives": container_validation.get("alternatives", [])
+                    })
+                    completed_steps += 1
+                    continue
+            
             # Execute with existing logic but enhanced context
             result = self.executor.execute(command)
             results.append(result)
@@ -2111,6 +2262,75 @@ class SmartExecutor:
             return True
         
         return False
+
+    def _validate_command_for_container(self, command: str, env_info: Dict[str, Any]) -> Dict[str, Any]:
+        """Validate if a command is appropriate for the current environment"""
+        environment_type = env_info.get("environment_type", {})
+        
+        if not environment_type.get("is_container", False):
+            return {"allowed": True, "reason": "Not a container environment"}
+        
+        capabilities = environment_type.get("capabilities", {})
+        limitations = environment_type.get("limitations", [])
+        
+        # Check for problematic commands in containers
+        problematic_patterns = [
+            ("systemctl", not capabilities.get("can_use_systemctl", False), "systemd not available in container"),
+            ("firewall-cmd", not capabilities.get("can_use_firewall", False), "firewall management not available in container"),
+            ("iptables", not capabilities.get("can_modify_network", False), "network modification not available in container"),
+            ("modprobe", not capabilities.get("can_modify_kernel", False), "kernel module access not available in container"),
+            ("mount", "limited_kernel_access" in limitations, "mount operations limited in container"),
+            ("sysctl", not capabilities.get("can_modify_kernel", False), "kernel parameter modification not available"),
+        ]
+        
+        command_lower = command.lower()
+        for pattern, is_problematic, reason in problematic_patterns:
+            if pattern in command_lower and is_problematic:
+                alternatives = environment_type.get("recommended_alternatives", {})
+                return {
+                    "allowed": False,
+                    "reason": reason,
+                    "alternatives": alternatives.get(f"{pattern}_alternatives", []),
+                    "container_type": environment_type.get("container_type", "unknown")
+                }
+        
+        return {"allowed": True, "reason": "Command appears safe for container environment"}
+
+    def _get_container_alternative_command(self, original_command: str, description: str, 
+                                         validation_result: Dict[str, Any], task_goal: str) -> Dict[str, Any]:
+        """Get container-appropriate alternative for a problematic command"""
+        if not self.analyzer._client:
+            return {"alternative_command": None}
+        
+        prompt = f"""
+        This command cannot run in a container environment. Provide a container-appropriate alternative.
+        
+        Original Command: {original_command}
+        Step Description: {description}
+        Overall Goal: {task_goal}
+        Container Type: {validation_result.get('container_type', 'unknown')}
+        Limitation: {validation_result.get('reason', 'unknown')}
+        
+        Suggested Alternatives: {validation_result.get('alternatives', [])}
+        
+        Provide a container-appropriate alternative command that achieves the same goal, or respond with "SKIP" if no alternative exists.
+        
+        Examples:
+        - systemctl start nginx → nginx -g "daemon off;" &
+        - firewall-cmd → echo "Configure firewall on container host"
+        - iptables → echo "Use container networking policies"
+        
+        Respond with just the alternative command, no explanation.
+        """
+        
+        try:
+            response = self.analyzer._call_llm(prompt).strip()
+            if response.upper() == "SKIP" or not response:
+                return {"alternative_command": None}
+            return {"alternative_command": response}
+        except Exception as e:
+            logger.error(f"Failed to get container alternative: {e}")
+            return {"alternative_command": None}
 
     def _detect_package_manager(self) -> Optional[str]:
         """Detect available package manager"""

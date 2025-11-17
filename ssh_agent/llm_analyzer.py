@@ -145,6 +145,45 @@ class ServerStateAnalyzer:
         
         Current System State: {json.dumps(current_state.get('current_state', {}), indent=2)}
         
+        CONTAINER ENVIRONMENT ANALYSIS:
+        ==============================
+        Environment Type: {json.dumps(env_info.get('environment_type', {}), indent=2)}
+
+        Container Info: {json.dumps(env_info.get('container_info', {}), indent=2)}
+
+        CONTAINER LIMITATIONS & ALTERNATIVES:
+        ====================================
+        If this is a container environment, you MUST:
+        1. AVOID systemctl commands if no systemd is available
+        2. AVOID kernel-related operations (iptables, firewall-cmd, modprobe)
+        3. AVOID hardware-specific commands
+        4. USE alternative approaches provided in the environment analysis
+        5. FOCUS on application-level solutions instead of system-level ones
+
+        CONTAINER-SPECIFIC COMMAND ALTERNATIVES:
+        =======================================
+        Instead of systemctl:
+        - Check processes: ps aux | grep service_name
+        - Start services: /usr/sbin/service_name &
+        - Use supervisord or similar process managers
+
+        Instead of firewall commands:
+        - Configure application security
+        - Use environment variables for security settings
+        - Document that firewall should be configured on host
+
+        Instead of network configuration:
+        - Use container networking features
+        - Configure through environment variables
+        - Use application-level network settings
+
+        CRITICAL CONTAINER RULES:
+        ========================
+        - If environment_type.is_container is true, DO NOT use systemctl unless capabilities.can_use_systemctl is true
+        - If limitations include "limited_kernel_access", DO NOT use iptables, firewall-cmd, or kernel modules
+        - Always check capabilities before suggesting system-level operations
+        - Provide container-appropriate alternatives when system operations are not possible
+        
         REQUIREMENTS:
         1. Use ONLY the package managers and tools that are actually available on this system
         2. Use distribution-specific package names and commands

@@ -29,6 +29,7 @@ class ServerContext:
         self.known_packages: Dict[str, str] = {}
         self.current_state: Dict[str, Any] = {}
         self.last_analysis: Optional[Dict[str, Any]] = None
+        self.environment_type: Optional[Dict[str, Any]] = None
     
     def update_context(self, command: str, result: CommandResult):
         """Update server state understanding"""
@@ -61,7 +62,7 @@ class ServerContext:
     
     def get_current_state(self) -> Dict[str, Any]:
         """Get current understanding of server state"""
-        return {
+        state = {
             "current_state": self.current_state.copy(),
             "recent_commands": self.command_history[-10:],
             "known_services": self.known_services.copy(),
@@ -69,6 +70,11 @@ class ServerContext:
             "last_snapshot": asdict(self.system_snapshots[-1]) if self.system_snapshots else None,
             "last_analysis": self.last_analysis
         }
+        
+        if self.environment_type:
+            state["environment_type"] = self.environment_type
+        
+        return state
     
     def create_system_snapshot(self, system_data: Dict[str, str]) -> SystemSnapshot:
         """Create a system snapshot from collected data"""
@@ -99,6 +105,15 @@ class ServerContext:
             "timestamp": datetime.now().isoformat(),
             "result": analysis_result
         }
+    
+    def update_environment_type(self, environment_type: Dict[str, Any]):
+        """Update environment type information"""
+        self.environment_type = environment_type
+        self.current_state.update({
+            "is_container": environment_type.get("is_container", False),
+            "container_type": environment_type.get("container_type", "unknown"),
+            "container_limitations": environment_type.get("limitations", [])
+        })
     
     def get_system_health_commands(self) -> List[str]:
         """Get list of commands to collect system health data"""
