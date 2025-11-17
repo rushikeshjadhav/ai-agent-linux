@@ -768,15 +768,24 @@ class SmartExecutor:
                     logger.debug(f"Failed to get filesystem info '{key}': {e}")
                     env_info["filesystem_info"][key] = f"error: {str(e)}"
             
-            # Container environment detection
+            # Enhanced container environment detection
             container_commands = [
                 ("container_check", "cat /.dockerenv 2>/dev/null && echo 'docker' || echo 'not_docker'"),
-                ("cgroup_check", "cat /proc/1/cgroup 2>/dev/null | grep -E '(docker|lxc|containerd)' && echo 'container' || echo 'not_container'"),
+                ("podman_check", "cat /run/.containerenv 2>/dev/null && echo 'podman' || echo 'not_podman'"),
+                ("cgroup_check", "cat /proc/1/cgroup 2>/dev/null | grep -E '(docker|lxc|containerd|podman)' && echo 'container' || echo 'not_container'"),
+                ("cgroup_v2_check", "cat /proc/self/cgroup 2>/dev/null | grep '0::/' && echo 'cgroup_v2' || echo 'cgroup_v1'"),
                 ("init_process", "ps -p 1 -o comm= 2>/dev/null"),
                 ("systemd_available", "systemctl --version 2>/dev/null && echo 'systemd_available' || echo 'no_systemd'"),
+                ("systemd_running", "systemctl is-system-running 2>/dev/null || echo 'systemd_not_running'"),
                 ("kernel_modules", "lsmod 2>/dev/null | wc -l"),
-                ("proc_mounts", "cat /proc/mounts | grep -E '(overlay|aufs|devicemapper)' | head -3"),
-                ("virtualization", "systemd-detect-virt 2>/dev/null || echo 'unknown'")
+                ("proc_mounts", "cat /proc/mounts | grep -E '(overlay|aufs|devicemapper|virtiofs|fuse|9p)' | head -5"),
+                ("virtualization", "systemd-detect-virt 2>/dev/null || echo 'unknown'"),
+                ("architecture", "uname -m"),
+                ("os_release", "cat /etc/os-release 2>/dev/null | head -5"),
+                ("container_runtime", "cat /proc/1/environ 2>/dev/null | tr '\\0' '\\n' | grep -E '(container|CONTAINER)' || echo 'no_container_env'"),
+                ("mac_specific", "mount | grep -E '(virtiofs|osxfs|9p)' || echo 'not_mac_mount'"),
+                ("selinux_status", "getenforce 2>/dev/null || echo 'no_selinux'"),
+                ("capabilities", "capsh --print 2>/dev/null | grep 'Current:' || echo 'no_capabilities'")
             ]
 
             env_info["container_info"] = {}
@@ -1026,72 +1035,157 @@ class SmartExecutor:
             }
 
     def _analyze_environment_type(self, container_info: Dict[str, str]) -> Dict[str, Any]:
-        """Analyze if we're in a container and what type"""
+        """Enhanced container detection for various platforms including Apple Silicon"""
         is_container = False
         container_type = "unknown"
         limitations = []
+        platform_info = {}
         
-        # Check for Docker
+        # Enhanced Docker detection
         if "docker" in container_info.get("container_check", ""):
             is_container = True
             container_type = "docker"
         
-        # Check cgroups
-        if "container" in container_info.get("cgroup_check", ""):
+        # Check for Podman
+        if "podman" in container_info.get("podman_check", ""):
+            is_container = True
+            container_type = "podman"
+        
+        # Enhanced cgroups detection (both v1 and v2)
+        cgroup_output = container_info.get("cgroup_check", "")
+        if "container" in cgroup_output or any(pattern in cgroup_output for pattern in [
+            "docker", "lxc", "containerd", "podman", "systemd:/docker", "0::/docker"
+        ]):
             is_container = True
             if container_type == "unknown":
-                container_type = "container"
+                if "podman" in cgroup_output:
+                    container_type = "podman"
+                elif "docker" in cgroup_output:
+                    container_type = "docker"
+                else:
+                    container_type = "container"
         
-        # Check init process
+        # Check for Apple Silicon/ARM64 specific patterns
+        arch = container_info.get("architecture", "")
+        if arch in ["aarch64", "arm64"]:
+            platform_info["architecture"] = "arm64"
+            # Apple Silicon containers often have specific mount patterns
+            proc_mounts = container_info.get("proc_mounts", "")
+            mac_mounts = container_info.get("mac_specific", "")
+            if any(pattern in proc_mounts for pattern in ["virtiofs", "fuse.osxfs", "9p"]) or \
+               any(pattern in mac_mounts for pattern in ["virtiofs", "osxfs", "9p"]):
+                platform_info["host_platform"] = "macos_apple_silicon"
+                is_container = True
+        
+        # Enhanced init process detection
         init_process = container_info.get("init_process", "")
-        if init_process in ["sh", "bash", "python", "node", "java"]:
-            is_container = True
-            limitations.append("no_init_system")
+        container_init_processes = ["sh", "bash", "python", "node", "java", "systemd", "/sbin/init"]
+        if init_process in container_init_processes:
+            if init_process in ["sh", "bash", "python", "node", "java"]:
+                is_container = True
+                limitations.append("no_init_system")
+            elif init_process == "systemd" and is_container:
+                # systemd in container - limited capabilities
+                limitations.append("limited_systemd")
         
-        # Check systemd availability
-        if "no_systemd" in container_info.get("systemd_available", ""):
+        # Enhanced systemd detection
+        systemd_status = container_info.get("systemd_available", "")
+        systemd_running = container_info.get("systemd_running", "")
+        if "no_systemd" in systemd_status:
             limitations.append("no_systemd")
+        elif "systemd_available" in systemd_status and is_container:
+            # Check if it's a limited systemd in container
+            if "systemd_not_running" in systemd_running:
+                limitations.append("limited_systemd")
         
-        # Check kernel module access
+        # Enhanced kernel module detection
         try:
             module_count = int(container_info.get("kernel_modules", "0"))
             if module_count < 10:  # Very few modules suggests container
                 limitations.append("limited_kernel_access")
+                is_container = True
         except ValueError:
             pass
         
-        # Check for overlay filesystem (common in containers)
-        if any(fs in container_info.get("proc_mounts", "") for fs in ["overlay", "aufs", "devicemapper"]):
+        # Enhanced filesystem detection
+        proc_mounts = container_info.get("proc_mounts", "")
+        container_fs_patterns = ["overlay", "aufs", "devicemapper", "virtiofs", "fuse.osxfs", "9p"]
+        if any(fs in proc_mounts for fs in container_fs_patterns):
             is_container = True
+            if "virtiofs" in proc_mounts or "fuse.osxfs" in proc_mounts:
+                platform_info["host_platform"] = "macos"
+            if "9p" in proc_mounts:
+                platform_info["virtualization"] = "qemu_kvm"
         
-        # Check virtualization detection
+        # Enhanced virtualization detection
         virt_type = container_info.get("virtualization", "")
-        if virt_type in ["docker", "lxc", "container"]:
+        if virt_type in ["docker", "lxc", "container", "podman"]:
             is_container = True
             container_type = virt_type
+        elif virt_type in ["qemu", "kvm", "vmware", "parallels"]:
+            platform_info["virtualization"] = virt_type
+            # Could be VM running containers
+            if is_container:
+                platform_info["nested_virtualization"] = True
+        
+        # CentOS 9 specific detection
+        os_info = container_info.get("os_release", "")
+        if any(pattern in os_info.lower() for pattern in ["centos", "rhel", "rocky", "alma"]):
+            platform_info["os_family"] = "rhel"
+            # RHEL-based containers often have specific characteristics
+            if is_container:
+                # Check for RHEL container-specific limitations
+                limitations.append("rhel_container_restrictions")
+        
+        # Add specific platform detection
+        platform_specific = {}
+        if is_container:
+            platform_specific = self._detect_centos9_apple_silicon(container_info)
         
         return {
             "is_container": is_container,
             "container_type": container_type,
             "limitations": limitations,
-            "capabilities": self._assess_container_capabilities(limitations),
-            "recommended_alternatives": self._get_container_alternatives(limitations)
+            "platform_info": platform_info,
+            "platform_specific": platform_specific,
+            "capabilities": self._assess_container_capabilities(limitations, platform_info),
+            "recommended_alternatives": self._get_container_alternatives(limitations, platform_info)
         }
 
-    def _assess_container_capabilities(self, limitations: List[str]) -> Dict[str, bool]:
-        """Assess what capabilities are available in this environment"""
-        return {
+    def _assess_container_capabilities(self, limitations: List[str], platform_info: Dict[str, Any]) -> Dict[str, bool]:
+        """Enhanced capability assessment with platform awareness"""
+        capabilities = {
             "can_use_systemctl": "no_systemd" not in limitations,
             "can_modify_kernel": "limited_kernel_access" not in limitations,
             "can_use_firewall": "limited_kernel_access" not in limitations,
             "can_install_packages": True,  # Usually possible in containers
             "can_manage_users": True,      # Usually possible
             "can_modify_network": "limited_kernel_access" not in limitations,
-            "has_init_system": "no_init_system" not in limitations
+            "has_init_system": "no_init_system" not in limitations,
+            "has_limited_systemd": "limited_systemd" in limitations
         }
+        
+        # Platform-specific capability adjustments
+        if platform_info.get("os_family") == "rhel":
+            # RHEL-based containers may have additional restrictions
+            if "rhel_container_restrictions" in limitations:
+                capabilities["can_use_subscription_manager"] = False
+                capabilities["can_modify_selinux"] = False
+        
+        if platform_info.get("host_platform") == "macos_apple_silicon":
+            # Apple Silicon containers may have specific limitations
+            capabilities["can_use_native_virtualization"] = False
+            capabilities["has_host_filesystem_integration"] = True
+        
+        if platform_info.get("nested_virtualization"):
+            # Nested virtualization has additional limitations
+            capabilities["can_use_kvm"] = False
+            capabilities["can_modify_hardware"] = False
+        
+        return capabilities
 
-    def _get_container_alternatives(self, limitations: List[str]) -> Dict[str, List[str]]:
-        """Get alternative approaches for container limitations"""
+    def _get_container_alternatives(self, limitations: List[str], platform_info: Dict[str, Any]) -> Dict[str, List[str]]:
+        """Enhanced alternatives with platform-specific options"""
         alternatives = {}
         
         if "no_systemd" in limitations:
@@ -1100,6 +1194,13 @@ class SmartExecutor:
                 "Start services directly with their binaries",
                 "Use container orchestration for service management",
                 "Check if service is running with ps/pgrep"
+            ]
+        elif "limited_systemd" in limitations:
+            alternatives["service_management"] = [
+                "Use systemctl for basic operations only",
+                "Avoid systemctl daemon-reload in containers",
+                "Use service-specific commands when possible",
+                "Check service status with systemctl status"
             ]
         
         if "limited_kernel_access" in limitations:
@@ -1116,8 +1217,67 @@ class SmartExecutor:
                 "Use environment variables for network config"
             ]
         
+        # Platform-specific alternatives
+        if platform_info.get("os_family") == "rhel":
+            alternatives["package_management"] = [
+                "Use dnf instead of yum where available",
+                "Consider using microdnf for minimal containers",
+                "Use rpm for direct package queries",
+                "Consider using container-specific package sets"
+            ]
+        
+        if platform_info.get("host_platform") == "macos_apple_silicon":
+            alternatives["performance_optimization"] = [
+                "Use ARM64-native images when available",
+                "Leverage host filesystem integration",
+                "Consider using Rosetta 2 for x86_64 compatibility if needed",
+                "Use native Apple Silicon tools when possible"
+            ]
+        
         return alternatives
-
+    
+    def _detect_centos9_apple_silicon(self, container_info: Dict[str, str]) -> Dict[str, Any]:
+        """Specific detection for CentOS 9 on Apple Silicon"""
+        detection_result = {
+            "is_centos9": False,
+            "is_apple_silicon": False,
+            "specific_limitations": [],
+            "specific_capabilities": {}
+        }
+        
+        # Check for CentOS 9
+        os_release = container_info.get("os_release", "")
+        if any(pattern in os_release.lower() for pattern in [
+            "centos stream 9", "centos linux 9", "rocky linux 9", "alma linux 9"
+        ]):
+            detection_result["is_centos9"] = True
+        
+        # Check for Apple Silicon
+        arch = container_info.get("architecture", "")
+        mac_mounts = container_info.get("mac_specific", "")
+        proc_mounts = container_info.get("proc_mounts", "")
+        if arch == "aarch64" and (
+            "virtiofs" in mac_mounts or "osxfs" in mac_mounts or 
+            "virtiofs" in proc_mounts or "fuse.osxfs" in proc_mounts
+        ):
+            detection_result["is_apple_silicon"] = True
+            
+            # Apple Silicon specific limitations
+            detection_result["specific_limitations"] = [
+                "no_x86_emulation_in_container",
+                "limited_hardware_access",
+                "host_filesystem_permissions"
+            ]
+            
+            # Apple Silicon specific capabilities
+            detection_result["specific_capabilities"] = {
+                "has_arm64_optimization": True,
+                "can_use_host_filesystem": True,
+                "has_fast_io": True
+            }
+        
+        return detection_result
+    
     def _should_invalidate_cache(self, task_description: str) -> bool:
         """Determine if a task might change system state and require cache invalidation"""
         system_changing_keywords = [
