@@ -2591,6 +2591,316 @@ class SmartExecutor:
         Respond in JSON format with a detailed recovery plan.
         """
 
+    def _replan_remaining_steps(self, action_plan: ActionPlan, failed_step_index: int, 
+                               failed_result: CommandResult, task_description: str,
+                               prerequisite_results: Dict[str, Any], 
+                               completed_steps: List[CommandResult]) -> Dict[str, Any]:
+        """Replan remaining steps after a critical failure using LLM"""
+        
+        if not self.analyzer._client:
+            return {
+                "success": False,
+                "reason": "LLM not available for replanning",
+                "new_steps": []
+            }
+        
+        # Analyze what was accomplished so far
+        completed_analysis = self._analyze_completed_steps(completed_steps, action_plan.steps[:failed_step_index])
+        
+        # Get current system state
+        current_state = self.context.get_current_state()
+        env_info = current_state.get("environment", {})
+        
+        prompt = f"""
+        REPLANNING REQUIRED - Step Failed, Need New Approach
+        
+        ORIGINAL GOAL: {task_description}
+        
+        EXECUTION STATUS:
+        =================
+        Total Steps Planned: {len(action_plan.steps)}
+        Steps Completed Successfully: {failed_step_index}
+        Failed Step: {failed_step_index + 1}
+        
+        FAILED STEP DETAILS:
+        ===================
+        Command: {failed_result.command}
+        Description: {action_plan.steps[failed_step_index].get('description', 'No description')}
+        Exit Code: {failed_result.exit_code}
+        Error Output: {failed_result.stderr}
+        Standard Output: {failed_result.stdout}
+        
+        WHAT WAS ACCOMPLISHED:
+        =====================
+        {json.dumps(completed_analysis, indent=2)}
+        
+        REMAINING ORIGINAL STEPS (that need replanning):
+        ===============================================
+        {json.dumps([step.get('description', step.get('command', '')) for step in action_plan.steps[failed_step_index:]], indent=2)}
+        
+        SYSTEM CONTEXT:
+        ===============
+        Environment: {json.dumps(env_info.get('environment_type', {}), indent=2)}
+        Prerequisites: {json.dumps(prerequisite_results, indent=2)}
+        Current State: {json.dumps(current_state.get('current_state', {}), indent=2)}
+        
+        REPLANNING INSTRUCTIONS:
+        =======================
+        1. Analyze WHY the step failed (command not found, permission denied, wrong approach, etc.)
+        2. Determine what still needs to be accomplished to achieve the original goal
+        3. Create NEW steps that:
+           - Work around the failure cause
+           - Use alternative approaches/commands
+           - Build on what was already accomplished
+           - Are compatible with the current environment
+        4. Ensure the new plan can achieve the original goal despite the failure
+        
+        REPLANNING STRATEGIES:
+        =====================
+        - If command not found: use alternative commands or install missing tools
+        - If permission denied: add sudo or change approach
+        - If service issues: use different service management approach
+        - If package issues: use different package manager or manual installation
+        - If file/directory issues: create prerequisites or use different paths
+        - If network issues: check connectivity and use alternatives
+        
+        CRITICAL REQUIREMENTS:
+        =====================
+        - New steps must be compatible with detected environment type
+        - Use placeholders for auto-generation where needed
+        - Each step should include proper error checking
+        - Focus on achieving the ORIGINAL GOAL, not just fixing the failed step
+        
+        Respond in JSON format:
+        {{
+            "analysis": "why the step failed and what needs to be done differently",
+            "new_approach": "description of the new strategy",
+            "steps": [
+                {{
+                    "command": "new command with placeholders if needed",
+                    "description": "what this step accomplishes",
+                    "prerequisite_check": "command to verify prerequisites",
+                    "success_verification": "command to verify this step succeeded",
+                    "auto_generate": ["list of placeholders to generate"],
+                    "fallback_command": "alternative if this fails"
+                }}
+            ],
+            "confidence": 0.8,
+            "estimated_time": "X minutes"
+        }}
+        """
+        
+        try:
+            logger.info("Requesting replanning from LLM...")
+            response = self.analyzer._call_llm(prompt)
+            
+            # Parse the response
+            fallback_data = {
+                "analysis": "Failed to parse LLM response",
+                "new_approach": "Fallback approach",
+                "steps": [],
+                "confidence": 0.0,
+                "estimated_time": "unknown"
+            }
+            
+            replan_data = self.analyzer._robust_json_parse(response, fallback_data)
+            
+            new_steps = replan_data.get("steps", [])
+            
+            if not new_steps:
+                logger.warning("LLM returned no new steps in replan")
+                return {
+                    "success": False,
+                    "reason": "No new steps provided by LLM",
+                    "new_steps": []
+                }
+            
+            # Validate new steps
+            validated_steps = self._validate_replanned_steps(new_steps, env_info)
+            
+            logger.info(f"Replanning successful: {len(validated_steps)} new steps generated")
+            logger.info(f"New approach: {replan_data.get('new_approach', 'Not specified')}")
+            logger.info(f"LLM confidence: {replan_data.get('confidence', 0.0)}")
+            
+            return {
+                "success": True,
+                "new_steps": validated_steps,
+                "analysis": replan_data.get("analysis", ""),
+                "new_approach": replan_data.get("new_approach", ""),
+                "confidence": replan_data.get("confidence", 0.0)
+            }
+            
+        except Exception as e:
+            logger.error(f"Replanning failed: {e}")
+            logger.exception("Full traceback for replanning failure:")
+            
+            # Try to create a simple fallback replan
+            fallback_steps = self._create_simple_fallback_replan(
+                failed_result, task_description, action_plan.steps[failed_step_index:]
+            )
+            
+            return {
+                "success": len(fallback_steps) > 0,
+                "new_steps": fallback_steps,
+                "reason": f"LLM replanning failed: {str(e)}",
+                "analysis": "Fallback replanning due to LLM failure"
+            }
+
+    def _analyze_completed_steps(self, completed_results: List[CommandResult], 
+                               completed_step_definitions: List[Dict[str, Any]]) -> Dict[str, Any]:
+        """Analyze what was accomplished in the completed steps"""
+        analysis = {
+            "successful_operations": [],
+            "system_changes": [],
+            "installed_packages": [],
+            "started_services": [],
+            "created_files": [],
+            "user_changes": []
+        }
+        
+        for i, (result, step_def) in enumerate(zip(completed_results, completed_step_definitions)):
+            if result.exit_code == 0:
+                command = result.command
+                description = step_def.get("description", "")
+                
+                analysis["successful_operations"].append({
+                    "step": i + 1,
+                    "command": command,
+                    "description": description
+                })
+                
+                # Categorize the type of operation
+                if any(pkg_cmd in command for pkg_cmd in ["apt install", "yum install", "dnf install"]):
+                    # Extract package name
+                    parts = command.split()
+                    if len(parts) > 2:
+                        package = parts[-1]
+                        analysis["installed_packages"].append(package)
+                
+                elif any(svc_cmd in command for svc_cmd in ["systemctl start", "service start"]):
+                    # Extract service name
+                    parts = command.split()
+                    if len(parts) > 2:
+                        service = parts[-1]
+                        analysis["started_services"].append(service)
+                
+                elif any(file_cmd in command for file_cmd in ["touch", "echo >", "cat >", "mkdir"]):
+                    analysis["created_files"].append(command)
+                
+                elif any(user_cmd in command for user_cmd in ["useradd", "usermod", "groupadd"]):
+                    analysis["user_changes"].append(command)
+                
+                # Track general system changes
+                if any(change_cmd in command for change_cmd in ["install", "start", "enable", "create", "add", "modify"]):
+                    analysis["system_changes"].append({
+                        "type": "modification",
+                        "command": command,
+                        "description": description
+                    })
+        
+        return analysis
+
+    def _validate_replanned_steps(self, new_steps: List[Dict[str, Any]], 
+                                 env_info: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """Validate and enhance replanned steps"""
+        validated_steps = []
+        
+        for step in new_steps:
+            # Ensure required fields exist
+            validated_step = {
+                "command": step.get("command", ""),
+                "description": step.get("description", ""),
+                "prerequisite_check": step.get("prerequisite_check", ""),
+                "success_verification": step.get("success_verification", ""),
+                "auto_generate": step.get("auto_generate", []),
+                "fallback_command": step.get("fallback_command", "")
+            }
+            
+            # Validate command for container environment
+            if validated_step["command"]:
+                container_validation = self._validate_command_for_container(
+                    validated_step["command"], 
+                    {"environment_type": env_info.get("environment_type", {})}
+                )
+                
+                if not container_validation["allowed"]:
+                    logger.warning(f"Replanned step not suitable for container: {container_validation['reason']}")
+                    # Try to get alternative
+                    alternative = self._get_container_alternative_command(
+                        validated_step["command"],
+                        validated_step["description"],
+                        container_validation,
+                        "replanned step"
+                    )
+                    
+                    if alternative.get("alternative_command"):
+                        validated_step["command"] = alternative["alternative_command"]
+                        validated_step["description"] += " (container alternative)"
+                    else:
+                        # Skip this step
+                        logger.info(f"Skipping container-incompatible replanned step: {validated_step['description']}")
+                        continue
+            
+            validated_steps.append(validated_step)
+        
+        return validated_steps
+
+    def _create_simple_fallback_replan(self, failed_result: CommandResult, 
+                                      task_description: str, 
+                                      remaining_steps: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Create a simple fallback replan when LLM fails"""
+        logger.info("Creating simple fallback replan")
+        
+        fallback_steps = []
+        
+        # Analyze the failure
+        if "command not found" in failed_result.stderr:
+            # Try to install missing command
+            missing_cmd = failed_result.command.split()[0]
+            fallback_steps.append({
+                "command": f"apt install -y {missing_cmd} || yum install -y {missing_cmd} || echo 'Could not install {missing_cmd}'",
+                "description": f"Attempt to install missing command: {missing_cmd}",
+                "prerequisite_check": "",
+                "success_verification": f"which {missing_cmd}",
+                "auto_generate": [],
+                "fallback_command": f"echo 'Manual installation of {missing_cmd} required'"
+            })
+            
+            # Retry the original failed command
+            fallback_steps.append({
+                "command": failed_result.command,
+                "description": f"Retry failed command: {failed_result.command}",
+                "prerequisite_check": f"which {missing_cmd}",
+                "success_verification": "",
+                "auto_generate": [],
+                "fallback_command": ""
+            })
+        
+        elif "permission denied" in failed_result.stderr.lower():
+            # Add sudo to the command
+            if not failed_result.command.startswith("sudo"):
+                fallback_steps.append({
+                    "command": f"sudo {failed_result.command}",
+                    "description": f"Retry with sudo: {failed_result.command}",
+                    "prerequisite_check": "sudo -n true 2>/dev/null || echo 'sudo required'",
+                    "success_verification": "",
+                    "auto_generate": [],
+                    "fallback_command": ""
+                })
+        
+        else:
+            # Generic retry with verification
+            fallback_steps.append({
+                "command": f"echo 'Analyzing failure: {failed_result.stderr[:100]}'",
+                "description": "Log failure analysis",
+                "prerequisite_check": "",
+                "success_verification": "",
+                "auto_generate": [],
+                "fallback_command": ""
+            })
+        
+        return fallback_steps
+
     def _create_fallback_plan(self, original_task: str, failure_analysis: Dict[str, Any]) -> ActionPlan:
         """Create a basic fallback plan when LLM consultation fails"""
         fallback_steps = []
