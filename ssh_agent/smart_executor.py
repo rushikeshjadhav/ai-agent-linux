@@ -776,16 +776,21 @@ class SmartExecutor:
                 ("cgroup_v2_check", "cat /proc/self/cgroup 2>/dev/null | grep '0::/' && echo 'cgroup_v2' || echo 'cgroup_v1'"),
                 ("init_process", "ps -p 1 -o comm= 2>/dev/null"),
                 ("systemd_available", "systemctl --version 2>/dev/null && echo 'systemd_available' || echo 'no_systemd'"),
-                ("systemd_running", "systemctl is-system-running 2>/dev/null || echo 'systemd_not_running'"),
+                ("systemd_running", "systemctl is-system-running 2>&1 || echo 'systemd_not_running'"),  # Capture stderr too
+                ("systemd_functional", "systemctl status 2>&1 | head -3"),  # Test actual functionality
                 ("kernel_modules", "lsmod 2>/dev/null | wc -l"),
                 ("proc_mounts", "cat /proc/mounts | grep -E '(overlay|aufs|devicemapper|virtiofs|fuse|9p)' | head -5"),
                 ("virtualization", "systemd-detect-virt 2>/dev/null || echo 'unknown'"),
                 ("architecture", "uname -m"),
                 ("os_release", "cat /etc/os-release 2>/dev/null | head -5"),
-                ("container_runtime", "cat /proc/1/environ 2>/dev/null | tr '\\0' '\\n' | grep -E '(container|CONTAINER)' || echo 'no_container_env'"),
+                ("container_runtime", "cat /proc/1/environ 2>/dev/null | tr '\\0' '\\n' | grep -E '(container|CONTAINER|DOCKER)' || echo 'no_container_env'"),
                 ("mac_specific", "mount | grep -E '(virtiofs|osxfs|9p)' || echo 'not_mac_mount'"),
                 ("selinux_status", "getenforce 2>/dev/null || echo 'no_selinux'"),
-                ("capabilities", "capsh --print 2>/dev/null | grep 'Current:' || echo 'no_capabilities'")
+                ("capabilities", "capsh --print 2>/dev/null | grep 'Current:' || echo 'no_capabilities'"),
+                ("cpu_info", "cat /proc/cpuinfo | grep -E '(model name|vendor_id)' | head -2"),
+                ("docker_info", "cat /proc/1/environ 2>/dev/null | tr '\\0' '\\n' | grep -i docker || echo 'no_docker_env'"),
+                ("hypervisor_check", "cat /proc/cpuinfo | grep -i hypervisor || echo 'no_hypervisor'"),
+                ("dmi_info", "dmidecode -s system-manufacturer 2>/dev/null || echo 'no_dmi'")
             ]
 
             env_info["container_info"] = {}
@@ -1065,15 +1070,50 @@ class SmartExecutor:
                 else:
                     container_type = "container"
         
-        # Check for Apple Silicon/ARM64 specific patterns
+        # ENHANCED APPLE SILICON DETECTION - Look beyond just architecture
         arch = container_info.get("architecture", "")
-        if arch in ["aarch64", "arm64"]:
+        
+        # Check for Apple Silicon host indicators even when container shows x86_64
+        apple_silicon_indicators = []
+        
+        # Check mount points for Apple Silicon specific filesystems
+        proc_mounts = container_info.get("proc_mounts", "")
+        mac_mounts = container_info.get("mac_specific", "")
+        
+        if any(pattern in proc_mounts for pattern in ["virtiofs", "fuse.osxfs", "9p"]) or \
+           any(pattern in mac_mounts for pattern in ["virtiofs", "osxfs", "9p"]):
+            apple_silicon_indicators.append("apple_filesystem")
+            platform_info["host_platform"] = "macos"
+            is_container = True
+        
+        # Check for QEMU/emulation indicators (common on Apple Silicon)
+        if "qemu" in container_info.get("virtualization", "").lower():
+            apple_silicon_indicators.append("qemu_virtualization")
+            platform_info["virtualization"] = "qemu"
+        
+        # Check for Apple Silicon specific CPU features in /proc/cpuinfo
+        # Even in emulated x86_64, there might be hints
+        cpu_info = container_info.get("cpu_info", "")
+        if any(indicator in cpu_info.lower() for indicator in ["apple", "m1", "m2", "m3"]):
+            apple_silicon_indicators.append("apple_cpu_detected")
+        
+        # Check for Docker Desktop indicators (common on macOS)
+        container_runtime = container_info.get("container_runtime", "")
+        if "docker-desktop" in container_runtime.lower():
+            apple_silicon_indicators.append("docker_desktop")
+            platform_info["host_platform"] = "macos"
+            is_container = True
+        
+        # If we have multiple Apple Silicon indicators, mark as Apple Silicon even if arch is x86_64
+        if len(apple_silicon_indicators) >= 2:
+            platform_info["host_platform"] = "macos_apple_silicon"
+            platform_info["emulated_architecture"] = arch  # Store the emulated arch
+            platform_info["apple_silicon_indicators"] = apple_silicon_indicators
+            is_container = True
+            logger.info(f"Apple Silicon host detected via indicators: {apple_silicon_indicators}")
+        elif arch in ["aarch64", "arm64"]:
             platform_info["architecture"] = "arm64"
-            # Apple Silicon containers often have specific mount patterns
-            proc_mounts = container_info.get("proc_mounts", "")
-            mac_mounts = container_info.get("mac_specific", "")
-            if any(pattern in proc_mounts for pattern in ["virtiofs", "fuse.osxfs", "9p"]) or \
-               any(pattern in mac_mounts for pattern in ["virtiofs", "osxfs", "9p"]):
+            if apple_silicon_indicators:
                 platform_info["host_platform"] = "macos_apple_silicon"
                 is_container = True
         
@@ -1088,14 +1128,24 @@ class SmartExecutor:
                 # systemd in container - limited capabilities
                 limitations.append("limited_systemd")
         
-        # Enhanced systemd detection
+        # ENHANCED SYSTEMD DETECTION - Check both availability AND functionality
         systemd_status = container_info.get("systemd_available", "")
         systemd_running = container_info.get("systemd_running", "")
+        
         if "no_systemd" in systemd_status:
             limitations.append("no_systemd")
-        elif "systemd_available" in systemd_status and is_container:
-            # Check if it's a limited systemd in container
-            if "systemd_not_running" in systemd_running:
+        elif "systemd_available" in systemd_status:
+            # systemctl command exists, but check if it's functional
+            if any(error_msg in systemd_running.lower() for error_msg in [
+                "system has not been booted with systemd",
+                "can't operate",
+                "failed to connect to bus",
+                "systemd_not_running"
+            ]):
+                limitations.append("no_systemd")
+                logger.info("systemctl command exists but systemd is not functional - treating as no_systemd")
+            elif is_container:
+                # systemd exists and appears functional in container - limited capabilities
                 limitations.append("limited_systemd")
         
         # Enhanced kernel module detection
@@ -1141,6 +1191,10 @@ class SmartExecutor:
         platform_specific = {}
         if is_container:
             platform_specific = self._detect_centos9_apple_silicon(container_info)
+            # Override detection if we found Apple Silicon indicators
+            if apple_silicon_indicators:
+                platform_specific["is_apple_silicon"] = True
+                platform_specific["apple_silicon_indicators"] = apple_silicon_indicators
         
         return {
             "is_container": is_container,
@@ -1155,14 +1209,15 @@ class SmartExecutor:
     def _assess_container_capabilities(self, limitations: List[str], platform_info: Dict[str, Any]) -> Dict[str, bool]:
         """Enhanced capability assessment with platform awareness"""
         capabilities = {
-            "can_use_systemctl": "no_systemd" not in limitations,
+            "can_use_systemctl": "no_systemd" not in limitations and "limited_systemd" not in limitations,
             "can_modify_kernel": "limited_kernel_access" not in limitations,
             "can_use_firewall": "limited_kernel_access" not in limitations,
             "can_install_packages": True,  # Usually possible in containers
             "can_manage_users": True,      # Usually possible
             "can_modify_network": "limited_kernel_access" not in limitations,
             "has_init_system": "no_init_system" not in limitations,
-            "has_limited_systemd": "limited_systemd" in limitations
+            "has_limited_systemd": "limited_systemd" in limitations,
+            "has_functional_systemd": "no_systemd" not in limitations and "limited_systemd" not in limitations
         }
         
         # Platform-specific capability adjustments
@@ -1172,10 +1227,11 @@ class SmartExecutor:
                 capabilities["can_use_subscription_manager"] = False
                 capabilities["can_modify_selinux"] = False
         
-        if platform_info.get("host_platform") == "macos_apple_silicon":
+        if platform_info.get("host_platform") in ["macos_apple_silicon", "macos"]:
             # Apple Silicon containers may have specific limitations
             capabilities["can_use_native_virtualization"] = False
             capabilities["has_host_filesystem_integration"] = True
+            capabilities["supports_emulation"] = platform_info.get("emulated_architecture") == "x86_64"
         
         if platform_info.get("nested_virtualization"):
             # Nested virtualization has additional limitations
@@ -1190,31 +1246,36 @@ class SmartExecutor:
         
         if "no_systemd" in limitations:
             alternatives["service_management"] = [
+                "Use direct service commands: /usr/sbin/nginx, /usr/sbin/apache2",
+                "Start services in background: nginx -g 'daemon off;' &",
                 "Use process managers like supervisord",
-                "Start services directly with their binaries",
-                "Use container orchestration for service management",
-                "Check if service is running with ps/pgrep"
+                "Check processes with: ps aux | grep service_name",
+                "Use service command if available: service nginx start",
+                "Use init.d scripts: /etc/init.d/nginx start"
             ]
         elif "limited_systemd" in limitations:
             alternatives["service_management"] = [
-                "Use systemctl for basic operations only",
-                "Avoid systemctl daemon-reload in containers",
-                "Use service-specific commands when possible",
-                "Check service status with systemctl status"
+                "systemctl may not work - use direct service commands",
+                "Try: service nginx start instead of systemctl start nginx",
+                "Use process-specific commands: nginx -s reload",
+                "Check status with: ps aux | grep nginx",
+                "Avoid systemctl daemon-reload in containers"
             ]
         
         if "limited_kernel_access" in limitations:
             alternatives["firewall_management"] = [
-                "Use application-level security",
                 "Configure firewall on container host",
-                "Use network policies in orchestration",
-                "Implement security in application code"
+                "Use Docker/Podman network policies",
+                "Implement application-level security",
+                "Use environment variables for security config",
+                "Configure ingress/egress rules in orchestration"
             ]
             
             alternatives["network_management"] = [
                 "Use container networking features",
-                "Configure networking through orchestration",
-                "Use environment variables for network config"
+                "Configure through Docker/Podman commands",
+                "Use environment variables for network config",
+                "Configure networking in docker-compose or Kubernetes"
             ]
         
         # Platform-specific alternatives
@@ -1223,27 +1284,39 @@ class SmartExecutor:
                 "Use dnf instead of yum where available",
                 "Consider using microdnf for minimal containers",
                 "Use rpm for direct package queries",
-                "Consider using container-specific package sets"
+                "Try: dnf install --nobest for dependency issues"
             ]
         
-        if platform_info.get("host_platform") == "macos_apple_silicon":
+        if platform_info.get("host_platform") in ["macos_apple_silicon", "macos"]:
             alternatives["performance_optimization"] = [
                 "Use ARM64-native images when available",
                 "Leverage host filesystem integration",
-                "Consider using Rosetta 2 for x86_64 compatibility if needed",
-                "Use native Apple Silicon tools when possible"
+                "Consider performance impact of x86_64 emulation" if platform_info.get("emulated_architecture") == "x86_64" else "Use native ARM64 performance",
+                "Use Docker Desktop volume mounts for better performance"
+            ]
+            
+            alternatives["architecture_considerations"] = [
+                "Be aware of x86_64 emulation overhead" if platform_info.get("emulated_architecture") == "x86_64" else "Native ARM64 performance available",
+                "Some x86_64 binaries may not work in emulation",
+                "Use multi-arch images when possible",
+                "Test performance-critical applications thoroughly"
             ]
         
         return alternatives
     
     def _detect_centos9_apple_silicon(self, container_info: Dict[str, str]) -> Dict[str, Any]:
-        """Specific detection for CentOS 9 on Apple Silicon"""
+        """Enhanced detection for CentOS 9 on Apple Silicon (including emulated x86_64)"""
         detection_result = {
             "is_centos9": False,
             "is_apple_silicon": False,
+            "emulated_x86": False,
             "specific_limitations": [],
-            "specific_capabilities": {}
+            "specific_capabilities": {},
+            "detection_confidence": 0.0
         }
+        
+        confidence_score = 0.0
+        apple_silicon_evidence = []
         
         # Check for CentOS 9
         os_release = container_info.get("os_release", "")
@@ -1251,30 +1324,85 @@ class SmartExecutor:
             "centos stream 9", "centos linux 9", "rocky linux 9", "alma linux 9"
         ]):
             detection_result["is_centos9"] = True
+            confidence_score += 0.3
         
-        # Check for Apple Silicon
+        # Check architecture - could be x86_64 due to emulation
         arch = container_info.get("architecture", "")
+        
+        # Apple Silicon indicators (even in emulated x86_64 containers)
+        
+        # 1. Check for Apple-specific filesystems
         mac_mounts = container_info.get("mac_specific", "")
         proc_mounts = container_info.get("proc_mounts", "")
-        if arch == "aarch64" and (
-            "virtiofs" in mac_mounts or "osxfs" in mac_mounts or 
-            "virtiofs" in proc_mounts or "fuse.osxfs" in proc_mounts
-        ):
+        if any(fs in mac_mounts for fs in ["virtiofs", "osxfs", "9p"]) or \
+           any(fs in proc_mounts for fs in ["virtiofs", "fuse.osxfs", "9p"]):
+            apple_silicon_evidence.append("apple_filesystem")
+            confidence_score += 0.4
+        
+        # 2. Check for QEMU virtualization (common on Apple Silicon)
+        virt_type = container_info.get("virtualization", "")
+        hypervisor = container_info.get("hypervisor_check", "")
+        if "qemu" in virt_type.lower() or "hypervisor" in hypervisor.lower():
+            apple_silicon_evidence.append("qemu_hypervisor")
+            confidence_score += 0.3
+        
+        # 3. Check for Docker Desktop environment variables
+        container_runtime = container_info.get("container_runtime", "")
+        docker_info = container_info.get("docker_info", "")
+        if any(indicator in (container_runtime + docker_info).lower() for indicator in [
+            "docker-desktop", "docker_desktop", "com.docker.driver"
+        ]):
+            apple_silicon_evidence.append("docker_desktop")
+            confidence_score += 0.4
+        
+        # 4. Check DMI info for Apple hardware
+        dmi_info = container_info.get("dmi_info", "")
+        if "apple" in dmi_info.lower():
+            apple_silicon_evidence.append("apple_hardware")
+            confidence_score += 0.5
+        
+        # 5. Check CPU info for emulation hints
+        cpu_info = container_info.get("cpu_info", "")
+        if any(hint in cpu_info.lower() for hint in [
+            "apple", "qemu", "tcg", "kvm", "virtualization"
+        ]):
+            apple_silicon_evidence.append("cpu_virtualization")
+            confidence_score += 0.2
+        
+        # 6. Check for specific mount patterns that indicate macOS host
+        if "9p" in proc_mounts or "virtiofs" in proc_mounts:
+            apple_silicon_evidence.append("macos_mount_patterns")
+            confidence_score += 0.3
+        
+        # Determine if this is Apple Silicon based on evidence
+        if confidence_score >= 0.6:  # Need strong evidence
             detection_result["is_apple_silicon"] = True
+            
+            # Check if this is emulated x86_64 on Apple Silicon
+            if arch == "x86_64":
+                detection_result["emulated_x86"] = True
+                apple_silicon_evidence.append("x86_emulation")
             
             # Apple Silicon specific limitations
             detection_result["specific_limitations"] = [
-                "no_x86_emulation_in_container",
+                "emulated_performance" if detection_result["emulated_x86"] else "native_arm64",
                 "limited_hardware_access",
-                "host_filesystem_permissions"
+                "host_filesystem_permissions",
+                "docker_desktop_networking"
             ]
             
             # Apple Silicon specific capabilities
             detection_result["specific_capabilities"] = {
-                "has_arm64_optimization": True,
-                "can_use_host_filesystem": True,
-                "has_fast_io": True
+                "has_host_filesystem": True,
+                "has_fast_io": True,
+                "supports_rosetta": detection_result["emulated_x86"],
+                "native_arm64": not detection_result["emulated_x86"]
             }
+        
+        detection_result["detection_confidence"] = confidence_score
+        detection_result["evidence"] = apple_silicon_evidence
+        
+        logger.info(f"Apple Silicon detection: confidence={confidence_score:.2f}, evidence={apple_silicon_evidence}")
         
         return detection_result
     
