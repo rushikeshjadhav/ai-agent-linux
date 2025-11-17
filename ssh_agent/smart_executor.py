@@ -2113,7 +2113,12 @@ class SmartExecutor:
         completed_steps = 0
         skipped_steps = []
         
-        for i, step in enumerate(action_plan.steps):
+        for i in range(len(action_plan.steps)):  # Use range instead of enumerate
+            # Check if we've exceeded the steps due to replanning
+            if i >= len(action_plan.steps):
+                break
+                
+            step = action_plan.steps[i]
             command = step.get("command", "")
             description = step.get("description", "")
             skip_condition = step.get("skip_condition", "")
@@ -2206,22 +2211,65 @@ class SmartExecutor:
                     results[-1] = result
                     continue
                 
-                # Existing validation logic with prerequisite context...
+                # ENHANCED FAILURE HANDLING WITH REPLANNING
+                logger.warning(f"Step {i+1} failed with exit code {result.exit_code}")
+                
+                # First, try step validation to see if goal was achieved despite failure
                 validation = self._validate_step_completion(step, result, task_description)
                 
                 if validation.get("continue", False):
-                    # Enhanced with prerequisite context
+                    # Step achieved goal despite failure - continue
                     validation["prerequisite_context"] = prerequisite_basis
                     completed_steps += 1
+                    
+                    # Handle corrected command if provided
+                    generated_command = validation.get("generated_command", "")
+                    if generated_command and generated_command != command:
+                        logger.info(f"Executing corrected command: {generated_command}")
+                        corrected_result = self.executor.execute(generated_command)
+                        results.append(corrected_result)
+                        self.context.update_context(generated_command, corrected_result)
+                        
+                        if corrected_result.exit_code == 0:
+                            logger.info("Corrected command succeeded!")
+                        else:
+                            logger.warning("Corrected command also failed, but continuing based on validation")
+                    
+                    continue
+                
+                # CRITICAL FAILURE - TRIGGER REPLANNING
+                logger.info(f"Critical failure at step {i+1}, triggering replanning...")
+                
+                # Get replanning from LLM
+                replan_result = self._replan_remaining_steps(
+                    action_plan=action_plan,
+                    failed_step_index=i,
+                    failed_result=result,
+                    task_description=task_description,
+                    prerequisite_results=prerequisite_results,
+                    completed_steps=results[:i]  # Steps completed so far
+                )
+                
+                if replan_result.get("success", False):
+                    # Replace remaining steps with replanned steps
+                    new_steps = replan_result.get("new_steps", [])
+                    logger.info(f"Replanning successful: replacing {len(action_plan.steps) - i} remaining steps with {len(new_steps)} new steps")
+                    
+                    # Update action plan with new steps
+                    action_plan.steps = action_plan.steps[:i] + new_steps
+                    
+                    # Continue execution with new plan (the loop will continue from next iteration)
                     continue
                 else:
+                    # Replanning failed - this is a critical failure
+                    logger.error(f"Replanning failed: {replan_result.get('reason', 'Unknown reason')}")
                     return TaskResult(
                         task_description=task_description,
                         success=False,
                         steps_completed=completed_steps,
                         total_steps=len(action_plan.steps),
                         results=results,
-                        error_message=f"Critical failure: {validation.get('reason', result.stderr)}",
+                        error_message=f"Critical failure with replanning failure: {replan_result.get('reason', result.stderr)}",
                         skipped_steps=skipped_steps
                     )
             else:
