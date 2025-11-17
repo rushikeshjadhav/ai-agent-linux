@@ -167,6 +167,14 @@ class ServerStateAnalyzer:
         - Start services: /usr/sbin/service_name &
         - Use supervisord or similar process managers
 
+        For nginx specifically:
+        - Start: nginx -g "daemon off;" & (background) or nginx (daemon)
+        - Stop: nginx -s quit
+        - Reload: nginx -s reload  
+        - Test config: nginx -t
+        - Check status: ps aux | grep nginx
+        - Check ports: netstat -tlnp | grep :80
+
         Instead of firewall commands:
         - Configure application security
         - Use environment variables for security settings

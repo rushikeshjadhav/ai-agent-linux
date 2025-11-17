@@ -777,7 +777,8 @@ class SmartExecutor:
                 ("init_process", "ps -p 1 -o comm= 2>/dev/null"),
                 ("systemd_available", "systemctl --version 2>/dev/null && echo 'systemd_available' || echo 'no_systemd'"),
                 ("systemd_running", "systemctl is-system-running 2>&1 || echo 'systemd_not_running'"),  # Capture stderr too
-                ("systemd_functional", "systemctl status 2>&1 | head -3"),  # Test actual functionality
+                ("systemd_functional", "systemctl list-units --type=service --state=running 2>&1 | head -1 || echo 'systemd_not_functional'"),  # Better test
+                ("systemd_pid1", "ps -p 1 -o comm= | grep systemd && echo 'systemd_is_pid1' || echo 'systemd_not_pid1'"),  # Check if systemd is PID 1
                 ("kernel_modules", "lsmod 2>/dev/null | wc -l"),
                 ("proc_mounts", "cat /proc/mounts | grep -E '(overlay|aufs|devicemapper|virtiofs|fuse|9p)' | head -5"),
                 ("virtualization", "systemd-detect-virt 2>/dev/null || echo 'unknown'"),
@@ -1248,10 +1249,23 @@ class SmartExecutor:
             alternatives["service_management"] = [
                 "Use direct service commands: /usr/sbin/nginx, /usr/sbin/apache2",
                 "Start services in background: nginx -g 'daemon off;' &",
+                "For nginx: nginx && echo 'nginx started'",
+                "For nginx reload: nginx -s reload",
+                "For nginx stop: nginx -s quit",
                 "Use process managers like supervisord",
                 "Check processes with: ps aux | grep service_name",
                 "Use service command if available: service nginx start",
                 "Use init.d scripts: /etc/init.d/nginx start"
+            ]
+            
+            alternatives["nginx_specific"] = [
+                "Start nginx: nginx -g 'daemon off;' &",
+                "Start nginx (daemon): nginx",
+                "Test nginx config: nginx -t",
+                "Reload nginx: nginx -s reload",
+                "Stop nginx: nginx -s quit",
+                "Check nginx status: ps aux | grep nginx",
+                "Check nginx listening: netstat -tlnp | grep :80"
             ]
         elif "limited_systemd" in limitations:
             alternatives["service_management"] = [
@@ -2680,6 +2694,22 @@ class SmartExecutor:
         for pattern, is_problematic, reason in problematic_patterns:
             if pattern in command_lower and is_problematic:
                 alternatives = environment_type.get("recommended_alternatives", {})
+                
+                # Provide specific nginx alternatives
+                if "nginx" in command_lower and pattern == "systemctl":
+                    nginx_alternatives = [
+                        "nginx -g 'daemon off;' &  # Start nginx in background",
+                        "nginx  # Start nginx as daemon", 
+                        "nginx -t  # Test configuration",
+                        "ps aux | grep nginx  # Check if running"
+                    ]
+                    return {
+                        "allowed": False,
+                        "reason": f"{reason} - use direct nginx commands instead",
+                        "alternatives": nginx_alternatives,
+                        "container_type": environment_type.get("container_type", "unknown")
+                    }
+                
                 return {
                     "allowed": False,
                     "reason": reason,
