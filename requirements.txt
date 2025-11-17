@@ -1,3 +1,18 @@
-paramiko>=2.11.0
-openai>=1.0.0
-anthropic>=0.7.0
+# Core SSH functionality
+paramiko>=2.11.0,<3.0.0
+
+# LLM providers
+openai>=1.0.0,<2.0.0
+anthropic>=0.7.0,<1.0.0
+
+# HTTP client (used by OpenAI SDK and for OpenRouter)
+httpx>=0.24.0,<1.0.0
+
+# JSON schema validation (for robust LLM response parsing)
+jsonschema>=4.0.0,<5.0.0
+
+# Utility dependencies
+python-dateutil>=2.8.0
+
+# Optional: Enhanced logging with colors
+colorlog>=6.0.0
