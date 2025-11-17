@@ -585,7 +585,18 @@ capsh --print 2>/dev/null || echo "No capability info available"
 
 ## License
 
-[Add your license here]
+This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
+
+### Third-Party Dependencies
+
+This project uses several third-party libraries, each with their own licenses:
+- **paramiko**: LGPL 2.1+ (SSH functionality)
+- **openai**: MIT License (OpenAI API client)
+- **anthropic**: MIT License (Anthropic API client)
+- **httpx**: BSD 3-Clause (HTTP client)
+- **jsonschema**: MIT License (JSON validation)
+
+Please review the licenses of these dependencies to ensure compliance with your use case.
 
 ## Disclaimer
 
