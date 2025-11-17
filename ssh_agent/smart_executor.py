@@ -342,6 +342,31 @@ class SmartExecutor:
                 safety_score=0.0
             )
         
+        # Add container constraints if needed
+        container_constraints = ""
+        environment_type = env_info.get('environment_type', {})
+        if environment_type.get('is_container', False):
+            limitations = environment_type.get('limitations', [])
+            capabilities = environment_type.get('capabilities', {})
+            
+            container_constraints = f"""
+            
+            CRITICAL CONTAINER CONSTRAINTS FOR THIS SYSTEM:
+            ===============================================
+            This system is a {environment_type.get('container_type', 'unknown')} container.
+            
+            DETECTED LIMITATIONS: {limitations}
+            DETECTED CAPABILITIES: {json.dumps(capabilities, indent=2)}
+            
+            ABSOLUTE REQUIREMENTS:
+            - If "no_systemd" in limitations: NEVER use systemctl commands
+            - If can_use_systemctl is false: NEVER use systemctl commands  
+            - If can_use_firewall is false: NEVER use iptables/firewall-cmd
+            - If can_modify_kernel is false: NEVER use modprobe/sysctl
+            
+            YOU MUST USE CONTAINER-APPROPRIATE ALTERNATIVES ONLY.
+            """
+        
         prompt = f"""
         Create a comprehensive action plan with full prerequisite knowledge:
         
@@ -382,6 +407,7 @@ class SmartExecutor:
         
         CRITICAL: Always provide at least one step, even if it's just verification.
         CRITICAL: Respond with ONLY valid JSON, no additional text.
+        {container_constraints}
         
         {{
             "goal": "{task_description}",
@@ -417,7 +443,17 @@ class SmartExecutor:
             
             parsed_data = self.analyzer._robust_json_parse(response, fallback_data)
             
-            # Create ActionPlan from parsed data
+            # Validate and fix commands for container compatibility
+            steps = parsed_data.get("steps", [])
+            if steps and env_info.get('environment_type', {}).get('is_container', False):
+                logger.info("Validating planned commands for container compatibility...")
+                validated_steps = self._validate_planned_commands_for_container(
+                    steps, env_info.get('environment_type', {})
+                )
+                parsed_data["steps"] = validated_steps
+                logger.info(f"Container validation completed: {len(validated_steps)} steps validated")
+            
+            # Create ActionPlan from validated data
             action_plan = ActionPlan(
                 goal=parsed_data.get("goal", task_description),
                 steps=parsed_data.get("steps", []),
@@ -3290,6 +3326,68 @@ class SmartExecutor:
                         continue
             
             validated_steps.append(validated_step)
+        
+        return validated_steps
+
+    def _validate_planned_commands_for_container(self, steps: List[Dict[str, Any]], 
+                                               environment_type: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """Validate and fix planned commands for container compatibility"""
+        if not environment_type.get('is_container', False):
+            return steps
+        
+        limitations = environment_type.get('limitations', [])
+        capabilities = environment_type.get('capabilities', {})
+        validated_steps = []
+        
+        for step in steps:
+            command = step.get('command', '')
+            description = step.get('description', '')
+            
+            # Check for problematic commands
+            if 'systemctl' in command and ('no_systemd' in limitations or not capabilities.get('can_use_systemctl', False)):
+                logger.warning(f"Fixing systemctl command in container: {command}")
+                
+                # Replace with container alternative
+                if 'nginx' in command:
+                    if 'start' in command:
+                        step['command'] = 'nginx -g "daemon off;" &'
+                        step['description'] = f"{description} (container alternative: direct nginx start)"
+                    elif 'stop' in command:
+                        step['command'] = 'nginx -s quit'
+                        step['description'] = f"{description} (container alternative: nginx quit)"
+                    elif 'status' in command:
+                        step['command'] = 'ps aux | grep nginx'
+                        step['description'] = f"{description} (container alternative: process check)"
+                    elif 'enable' in command:
+                        step['command'] = 'echo "nginx will start with container"'
+                        step['description'] = f"{description} (container note: no systemd enable needed)"
+                    else:
+                        # Generic nginx command
+                        step['command'] = 'nginx -t && nginx'
+                        step['description'] = f"{description} (container alternative: direct nginx)"
+                
+                elif 'apache' in command:
+                    if 'start' in command:
+                        step['command'] = 'apache2 -D FOREGROUND &'
+                        step['description'] = f"{description} (container alternative: direct apache start)"
+                    elif 'stop' in command:
+                        step['command'] = 'pkill apache2'
+                        step['description'] = f"{description} (container alternative: kill apache)"
+                    else:
+                        step['command'] = 'apache2ctl configtest && apache2 -D FOREGROUND &'
+                        step['description'] = f"{description} (container alternative: direct apache)"
+                
+                else:
+                    # Generic service command
+                    service_name = command.split()[-1] if command.split() else 'service'
+                    step['command'] = f'ps aux | grep {service_name} || echo "Service {service_name} management in container"'
+                    step['description'] = f"{description} (container alternative: process check)"
+            
+            elif any(cmd in command for cmd in ['iptables', 'firewall-cmd']) and not capabilities.get('can_use_firewall', False):
+                step['command'] = 'echo "Configure firewall on container host or use container networking policies"'
+                step['description'] = f"{description} (container note: firewall managed at host level)"
+            
+            validated_steps.append(step)
         
         return validated_steps
 
