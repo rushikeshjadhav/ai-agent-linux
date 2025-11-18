@@ -3245,6 +3245,44 @@ class SmartExecutor:
                 "analysis": "Fallback replanning due to LLM failure"
             }
 
+    def _discuss_plan_with_user(self, action_plan: ActionPlan, task_description: str, 
+                               env_info: Dict[str, Any], prerequisite_results: Dict[str, Any]) -> Optional[ActionPlan]:
+        """Simple plan discussion with user"""
+        
+        print(f"\n📋 Action Plan for: {action_plan.goal}")
+        print(f"⏱️  Estimated time: {action_plan.estimated_time}")
+        print(f"🛡️  Safety score: {action_plan.safety_score:.1f}/1.0")
+        
+        print(f"\n📝 Planned Steps ({len(action_plan.steps)} total):")
+        for i, step in enumerate(action_plan.steps, 1):
+            command = step.get("command", "")
+            description = step.get("description", "")
+            
+            # Truncate long commands for display
+            display_command = command if len(command) <= 60 else command[:57] + "..."
+            
+            print(f"  {i:2d}. {description}")
+            print(f"      💻 {display_command}")
+        
+        # Show risks if any
+        if action_plan.risks:
+            print(f"\n⚠️  Risks:")
+            for risk in action_plan.risks:
+                print(f"  • {risk}")
+        
+        print("\n🤔 Plan Review Options:")
+        print("1. Execute plan as-is")
+        print("2. Cancel execution")
+        
+        choice = input("\nChoose option (1-2): ").strip()
+        
+        if choice == "1":
+            print("✅ Proceeding with plan execution...")
+            return action_plan
+        else:
+            print("❌ Plan execution cancelled by user.")
+            return None
+
     def _analyze_completed_steps(self, completed_results: List[CommandResult], 
                                completed_step_definitions: List[Dict[str, Any]]) -> Dict[str, Any]:
         """Analyze what was accomplished in the completed steps"""
