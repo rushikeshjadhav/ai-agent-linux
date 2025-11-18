@@ -1,6 +1,6 @@
 # SSH Agent - Intelligent Remote Server Management
 
-An intelligent SSH agent that combines traditional command execution with LLM-powered analysis and planning for safe, efficient server management.
+An intelligent SSH agent that combines traditional command execution with LLM-powered analysis and planning for safe, efficient server management with advanced container awareness and failure recovery.
 
 ## ⚠️ Important Safety Notice
 
@@ -19,6 +19,7 @@ An intelligent SSH agent that combines traditional command execution with LLM-po
 - **LLM safety analysis**: AI validates action plans before execution
 - **Container awareness**: Automatically adapts to container environments
 - **Auto-approval controls**: Human oversight for critical operations
+- **Plan discussion**: Interactive plan review and modification before execution
 
 ### 🧠 Intelligent Operations
 - **Goal-based execution**: Describe what you want, let AI plan the steps
@@ -26,12 +27,14 @@ An intelligent SSH agent that combines traditional command execution with LLM-po
 - **Advanced failure recovery**: Automatic replanning when operations fail
 - **Health analysis**: AI-powered system health assessment
 - **Smart troubleshooting**: Diagnose and resolve issues intelligently
+- **Interactive planning**: Review and modify AI-generated plans before execution
 
 ### 🐳 Container Environment Support
-- **Automatic detection**: Identifies Docker, LXC, and other container types
+- **Automatic detection**: Identifies Docker, LXC, and other container types including Apple Silicon
 - **Smart adaptations**: Uses container-appropriate alternatives for system commands
 - **Capability assessment**: Determines what operations are possible in containers
 - **Alternative suggestions**: Provides workarounds for container limitations
+- **Apple Silicon detection**: Recognizes emulated x86_64 containers on Apple Silicon hosts
 
 ### 🔄 Advanced Failure Recovery
 - **Automatic replanning**: When critical steps fail, AI creates new approaches
@@ -50,6 +53,11 @@ An intelligent SSH agent that combines traditional command execution with LLM-po
 - **Remote storage**: Cache stored on target server, survives disconnections
 - **Smart invalidation**: Clears cache when system-changing operations occur
 - **Prerequisite optimization**: Skips unnecessary steps based on system state
+
+### 🛡️ Enhanced Execution Modes
+- **Basic Execution**: Direct command execution with safety checks
+- **Smart Execution**: LLM-planned operations with container awareness
+- **Enhanced Execution**: Full safeguards with system snapshots and rollback capabilities
 
 ## Installation
 
@@ -81,6 +89,9 @@ python ssh_agent_cli.py -H server.com -u admin -k ~/.ssh/id_rsa -m ro
 # Execute specific task with password auth
 python ssh_agent_cli.py -H localhost -u user --password -t "check disk space"
 
+# Intelligent mode with plan discussion
+python ssh_agent_cli.py -H server.com -u admin -k ~/.ssh/id_rsa -m smart -t "install nginx" --discuss-plan
+
 # Intelligent mode with auto-approval (use carefully!)
 python ssh_agent_cli.py -H server.com -u admin -k ~/.ssh/id_rsa -m smart -t "install nginx" --auto-approve
 
@@ -101,6 +112,9 @@ cache-status    # Check environment cache status and age
 cache-clear     # Clear environment cache from remote server
 mode <ro|rw|smart>  # Switch agent mode
 quit            # Exit (also: exit, q)
+
+# Plan discussion in interactive mode:
+install docker --discuss-plan  # Review plan before execution
 ```
 
 ### Python API Usage
@@ -113,7 +127,7 @@ agent = SSHAgent(
     hostname="your-server.com",
     username="admin",
     mode=AgentMode.READ_ONLY,  # Start safe!
-    llm_provider=LLMProvider.OPENAI,
+    llm_provider=LLMProvider.OPENROUTER,  # Recommended
     api_key="your-api-key"  # or set environment variable
 )
 
@@ -123,11 +137,19 @@ if agent.connect_with_key("~/.ssh/id_rsa"):
     result = agent.execute_command("df -h")
     print(result.stdout)
     
-    # Intelligent task execution with auto-generation
+    # Intelligent task execution with plan discussion
     agent.set_mode(AgentMode.INTELLIGENT)
     task_result = agent.execute_smart_action(
         "create user with secure password and ssh access",
-        auto_approve=False  # Will prompt for approval
+        auto_approve=False,  # Will prompt for approval
+        discuss_plan=True    # Interactive plan review
+    )
+    
+    # Enhanced execution with full safeguards
+    enhanced_result = agent.execute_enhanced_task(
+        "setup production web server with monitoring",
+        auto_approve=False,
+        human_callback=lambda goal, attempts, prereqs: {"continue": True, "guidance": "Use nginx instead of apache"}
     )
     
     # Check execution results
@@ -171,10 +193,107 @@ if agent.connect_with_key("~/.ssh/id_rsa"):
   - Container environment adaptation
   - Auto-generation of secure values
   - Environment caching for performance
+  - Interactive plan discussion
 - **Safeguards**: AI reviews all actions, suggests safer alternatives
 - **Use for**: Complex tasks, learning, guided administration, container management
 
+## Execution Modes
+
+### Basic Execution
+- Direct command execution with mode-based safety checks
+- Suitable for simple, well-understood operations
+
+### Smart Execution
+- LLM-powered planning and execution
+- Container environment adaptation
+- Automatic failure recovery with replanning
+- Auto-generation of missing values
+
+### Enhanced Execution
+- Full safeguards with system snapshots
+- Multiple retry attempts with LLM guidance
+- Automatic rollback capabilities
+- Human escalation for complex failures
+
+```python
+# Enhanced execution example
+result = agent.execute_enhanced_task(
+    "migrate database to new server",
+    auto_approve=False,
+    human_callback=lambda goal, attempts, prereqs: {
+        "continue": True,
+        "guidance": "Use pg_dump instead of mysqldump"
+    }
+)
+
+print(f"Total attempts: {result.total_attempts}")
+print(f"Rollback performed: {result.rollback_performed}")
+print(f"Human escalation: {result.human_escalation_required}")
+```
+
+## Plan Discussion Feature
+
+### Interactive Plan Review
+
+```python
+# Enable plan discussion for complex operations
+result = agent.execute_smart_action(
+    "setup complete web server with SSL and monitoring",
+    discuss_plan=True  # Enables interactive plan review
+)
+
+# The user will see:
+# 📋 Action Plan for: setup complete web server with SSL and monitoring
+# ⏱️  Estimated time: 15-20 minutes
+# 🛡️  Safety score: 0.8/1.0
+# 
+# 📝 Planned Steps (8 total):
+#    1. Update package lists
+#       💻 apt update
+#    2. Install nginx web server
+#       💻 apt install -y nginx
+#    ...
+# 
+# 🤔 Plan Review Options:
+# 1. Execute plan as-is
+# 2. Suggest modifications
+# 3. Cancel execution
+# 4. Show detailed step information
+# 5. Show environment context
+```
+
+### Plan Modification
+
+```bash
+# User can request modifications:
+💭 Describe your suggested modifications: Also install certbot for SSL certificates and configure basic monitoring with htop
+
+🔄 Revising plan based on your suggestions...
+📝 Plan Revision Notes:
+   Added certbot installation step and basic monitoring setup with htop for system resource monitoring.
+✅ Plan revised successfully!
+```
+
+### CLI Plan Discussion
+
+```bash
+# Use --discuss-plan flag for interactive review
+python ssh_agent_cli.py -H server.com -u admin -k ~/.ssh/id_rsa -m smart -t "install docker" --discuss-plan
+
+# Or in interactive mode
+💬 Enter task/command: setup web server --discuss-plan
+```
+
 ## LLM Providers
+
+### OpenRouter (Recommended)
+```bash
+export OPENROUTER_API_KEY="sk-or-..."
+```
+- **Best for**: Access to multiple AI models including Claude 3.5 Sonnet
+- **Models**: Claude 3.5 Sonnet (default), GPT-4, Llama, and more
+- **Strengths**: Model variety, competitive pricing, high reliability
+- **Default Model**: Claude 3.5 Sonnet via OpenRouter
 
 ### OpenAI (GPT-4)
 ```bash
@@ -184,14 +303,6 @@ export OPENAI_API_KEY="sk-..."
 - **Models**: GPT-4, GPT-3.5-turbo
 - **Strengths**: Broad knowledge, reliable responses
 
-### OpenRouter (Multiple Models)
-```bash
-export OPENROUTER_API_KEY="sk-or-..."
-```
-- **Best for**: Access to multiple AI models
-- **Models**: Claude 3.5 Sonnet, GPT-4, Llama, and more
-- **Strengths**: Model variety, competitive pricing
-
 ### Anthropic (Claude)
 ```bash
 export ANTHROPIC_API_KEY="sk-ant-..."
@@ -200,6 +311,64 @@ export ANTHROPIC_API_KEY="sk-ant-..."
 - **Models**: Claude 3 Sonnet, Claude 3 Haiku
 - **Strengths**: Safety focus, detailed explanations
 
+## Container Environment Support
+
+### Advanced Container Detection
+
+The SSH agent provides sophisticated container environment detection:
+
+```python
+# Automatic detection works for various scenarios
+agent = SSHAgent("container.local", "user", mode=AgentMode.INTELLIGENT)
+agent.connect_with_key("~/.ssh/id_rsa")
+
+# Check detailed container detection
+env_info = agent.context.get_current_state()
+environment_type = env_info.get('environment_type', {})
+
+print(f"Is container: {environment_type.get('is_container')}")
+print(f"Container type: {environment_type.get('container_type')}")
+print(f"Platform info: {environment_type.get('platform_info')}")
+print(f"Limitations: {environment_type.get('limitations')}")
+print(f"Capabilities: {environment_type.get('capabilities')}")
+```
+
+### Apple Silicon Container Detection
+
+```python
+# Detects Apple Silicon even in emulated x86_64 containers
+platform_specific = environment_type.get('platform_specific', {})
+if platform_specific.get('is_apple_silicon'):
+    print(f"Apple Silicon detected!")
+    print(f"Emulated x86: {platform_specific.get('emulated_x86')}")
+    print(f"Evidence: {platform_specific.get('apple_silicon_indicators')}")
+    print(f"Confidence: {platform_specific.get('detection_confidence')}")
+```
+
+### Container Adaptations
+
+```python
+# This automatically uses container-appropriate alternatives
+result = agent.execute_smart_action("start nginx service")
+
+# Regular system: systemctl start nginx
+# Container without systemd: nginx -g "daemon off;" &
+# Container with limited systemd: service nginx start
+
+# Firewall operations adapt automatically
+result = agent.execute_smart_action("configure firewall for web traffic")
+# Regular system: iptables/firewall-cmd rules
+# Container: "Configure firewall on container host" + networking guidance
+```
+
+### Container Limitations Handled
+- **No systemd**: Uses direct process execution (nginx, apache2 -D FOREGROUND)
+- **Limited systemd**: Uses service command instead of systemctl
+- **No iptables**: Suggests application-level security and host configuration
+- **Limited kernel access**: Avoids kernel module operations
+- **No init system**: Uses process managers or direct execution
+- **Network restrictions**: Uses container networking features and environment variables
+
 ## Intelligent Execution Flow
 
 The intelligent mode provides sophisticated execution with:
@@ -207,16 +376,18 @@ The intelligent mode provides sophisticated execution with:
 1. **Environment Analysis**: Comprehensive system detection and caching
 2. **Prerequisite Collection**: AI determines what info to gather before planning
 3. **Informed Planning**: Creates action plans based on actual system state
-4. **Container Adaptation**: Automatically adjusts for container environments
-5. **Auto-Generation**: Fills in missing values (passwords, timestamps, etc.)
-6. **Failure Recovery**: Automatic replanning when critical steps fail
-7. **Success Verification**: Confirms goal achievement with smart exit code interpretation
+4. **Plan Discussion** (optional): Interactive review and modification
+5. **Container Adaptation**: Automatically adjusts for container environments
+6. **Auto-Generation**: Fills in missing values (passwords, timestamps, etc.)
+7. **Failure Recovery**: Automatic replanning when critical steps fail
+8. **Success Verification**: Confirms goal achievement with smart exit code interpretation
 
 ```python
-# Execute intelligent task with auto-generation
+# Execute intelligent task with plan discussion
 result = agent.execute_smart_action(
     "create user with secure password and configure ssh access",
-    auto_approve=False  # Will prompt for approval of each step
+    auto_approve=False,  # Will prompt for approval of each step
+    discuss_plan=True    # Interactive plan review before execution
 )
 
 # Check what was auto-generated
@@ -260,10 +431,16 @@ result = agent.execute_smart_action("install minio object storage")
 
 # Original plan: dnf install minio (fails - package not found)
 # Agent detects critical failure and replans:
-# 1. Try alternative repositories
-# 2. Download and install manually
-# 3. Use Docker container instead
-# 4. Find alternative object storage solutions
+# 1. Analyzes why installation failed
+# 2. Creates new approach (try alternative repos, manual install, Docker)
+# 3. Executes recovery plan automatically
+# 4. Continues with original goal
+
+print(f"Recovery attempts: {result.recovery_attempts}")
+if result.failure_contexts:
+    for failure in result.failure_contexts:
+        print(f"Failure {failure.attempt_number}: {failure.original_error}")
+        print(f"Recovery analysis: {failure.llm_analysis}")
 ```
 
 ### Failure Types Handled
@@ -272,6 +449,7 @@ result = agent.execute_smart_action("install minio object storage")
 - **Package unavailable**: Finds alternative packages or installation methods
 - **Container incompatibility**: Provides container-appropriate alternatives
 - **Service failures**: Uses alternative service management approaches
+- **systemd not functional**: Automatically switches to direct service commands
 
 ## Automatic Value Generation
 
@@ -294,7 +472,7 @@ result = agent.execute_smart_action("create backup user with secure access")
 - **Random strings**: Alphanumeric strings for identifiers
 - **Temporary files**: Unique temporary filenames
 - **Secure keys**: Cryptographic key identifiers
-- **Random ports**: Available port numbers in safe ranges
+- **Random ports**: Available port numbers in safe ranges (50000-59999)
 
 ## Performance Features
 
@@ -331,7 +509,8 @@ cache-clear
 1. **Always begin in READ-ONLY mode**
 2. **Understand the system first** using health analysis
 3. **Test on non-production systems**
-4. **Review AI-generated plans** before execution
+4. **Use plan discussion** for complex operations
+5. **Review AI-generated plans** before execution
 
 ### 🔍 Monitor and Verify
 ```python
@@ -349,20 +528,26 @@ cache_result = agent.execute_command("test -f /tmp/ssh_agent_env_cache.json && e
 print(f"Cache status: {cache_result.stdout}")
 ```
 
-### 🛡️ Use Intelligent Mode Safeguards
+### 🛡️ Use Plan Discussion for Critical Operations
 ```python
-# For critical operations, use intelligent mode with manual approval
+# For critical operations, use plan discussion
 result = agent.execute_smart_action(
     "update all packages and restart services",
-    auto_approve=False  # Will prompt for approval of each step
+    auto_approve=False,  # Manual approval required
+    discuss_plan=True    # Interactive plan review
 )
 
-# Check execution details
-print(f"Task: {result.task_description}")
-print(f"Success: {result.success}")
-print(f"Steps: {result.steps_completed}/{result.total_steps}")
+# User can:
+# 1. Review each planned step
+# 2. Request modifications
+# 3. See detailed step information
+# 4. Cancel if needed
+# 5. Approve execution
+```
 
-# Check for auto-generated values
+### 📝 Review Auto-Generated Values
+```python
+# Check what values were automatically generated
 auto_generated_items = []
 for cmd_result in result.results:
     if cmd_result and hasattr(cmd_result, 'validation_info'):
@@ -409,45 +594,32 @@ python ssh_agent_cli.py -H server.com -u admin -k ~/.ssh/id_rsa -m smart -t "con
 python ssh_agent_cli.py -H server.com -u admin -k ~/.ssh/id_rsa -m smart -t "cache-status"
 ```
 
-### Package Management with Auto-Generation
-```python
-# Smart package installation with automatic adaptation
-result = agent.execute_smart_action("install docker and configure it for production use")
+### Complex Operations with Plan Discussion
+```bash
+# Review plan before execution
+python ssh_agent_cli.py -H server.com -u admin -k ~/.ssh/id_rsa -m smart -t "setup complete LAMP stack" --discuss-plan
 
-# The agent will:
-# 1. Detect the OS and use appropriate package manager
-# 2. Handle container environments appropriately
-# 3. Auto-generate any needed configuration values
-# 4. Adapt commands for the specific environment
-
-print(f"Installation success: {result.success}")
-for cmd_result in result.results:
-    if hasattr(cmd_result, 'validation_info'):
-        generated = cmd_result.validation_info.get('generated_values', {})
-        if generated:
-            print(f"Auto-generated: {list(generated.keys())}")
+# Interactive modification example:
+# 📋 Action Plan for: setup complete LAMP stack
+# 🤔 Plan Review Options:
+# 2. Suggest modifications
+# 💭 Describe your suggested modifications: Use nginx instead of apache and add SSL certificates
+# 🔄 Revising plan based on your suggestions...
+# ✅ Plan revised successfully!
 ```
 
-### Service Management with Container Awareness
-```python
-# Intelligent service management that adapts to environment
-result = agent.execute_smart_action("start nginx web server")
-
-# In regular systems: systemctl start nginx
-# In containers: nginx -g "daemon off;" &
-# Agent automatically chooses the right approach
-
-print(f"Service management success: {result.success}")
-```
-
-### Container Operations
+### Container Operations with Auto-Detection
 ```python
 # Agent automatically detects and adapts to container environments
-result = agent.execute_smart_action("configure firewall for web traffic")
+result = agent.execute_smart_action("start web server and configure firewall")
 
-# In regular systems: Uses iptables/firewall-cmd
-# In containers: Suggests host-level configuration
-# Provides appropriate alternatives automatically
+# Regular system:
+# - systemctl start nginx
+# - firewall-cmd --add-port=80/tcp
+
+# Container environment:
+# - nginx -g "daemon off;" &
+# - echo "Configure port 80 in container networking"
 
 if result.skipped_steps:
     print("Container adaptations made:")
@@ -455,22 +627,21 @@ if result.skipped_steps:
         print(f"  - {skip['description']}: {skip['reason']}")
 ```
 
-### Advanced Failure Recovery
+### Enhanced Execution with Safeguards
 ```python
-# Complex task with automatic replanning on failure
-result = agent.execute_smart_action("install and configure minio object storage")
+# Use enhanced execution for critical operations
+result = agent.execute_enhanced_task(
+    "migrate production database",
+    auto_approve=False,
+    human_callback=lambda goal, attempts, prereqs: {
+        "continue": True,
+        "guidance": "Create full backup before migration"
+    }
+)
 
-# If initial approach fails (e.g., package not found):
-# 1. Agent detects critical failure
-# 2. Analyzes why it failed
-# 3. Creates new plan (try different repos, manual install, alternatives)
-# 4. Executes recovery plan automatically
-
-print(f"Recovery attempts: {result.recovery_attempts}")
-if result.failure_contexts:
-    for failure in result.failure_contexts:
-        print(f"Failure {failure.attempt_number}: {failure.original_error}")
-        print(f"Recovery: {failure.llm_analysis}")
+print(f"Execution phases: {result.execution_phases}")
+print(f"System snapshots: {len(result.snapshots)}")
+print(f"Rollback available: {not result.rollback_performed}")
 ```
 
 ## Security Considerations
@@ -482,13 +653,21 @@ if result.failure_contexts:
 
 ### 🛡️ Access Control
 - **Principle of Least Privilege**: Start with read-only mode
-- **Command Validation**: Built-in safety checks
-- **Audit Trail**: All commands are logged with context
+- **Command Validation**: Built-in safety checks with container awareness
+- **Audit Trail**: All commands logged with context and auto-generated values
+- **Plan Review**: Interactive plan discussion for transparency
 
 ### 🔍 Monitoring
 - **Command History**: Track all executed commands
-- **System Snapshots**: Monitor system state changes
+- **System Snapshots**: Monitor system state changes (enhanced mode)
 - **LLM Analysis**: AI reviews all operations for safety
+- **Failure Recovery**: Automatic recovery attempts are logged
+
+### 🐳 Container Security
+- **Capability Assessment**: Understands container limitations
+- **Host-Level Operations**: Suggests appropriate host configuration
+- **Network Security**: Recommends container networking best practices
+- **Auto-Generated Values**: Secure password generation for container users
 
 ## Troubleshooting
 
@@ -511,29 +690,52 @@ echo $OPENAI_API_KEY
 echo $OPENROUTER_API_KEY
 echo $ANTHROPIC_API_KEY
 
-# Test OpenAI API connectivity
-curl -H "Authorization: Bearer $OPENAI_API_KEY" \
-     https://api.openai.com/v1/models
-
-# Test OpenRouter API connectivity
+# Test OpenRouter API connectivity (recommended)
 curl -H "Authorization: Bearer $OPENROUTER_API_KEY" \
      https://openrouter.ai/api/v1/models
-
-# Test Anthropic API connectivity
-curl -H "x-api-key: $ANTHROPIC_API_KEY" \
-     https://api.anthropic.com/v1/messages
 ```
 
 ### Container Environment Issues
 ```bash
-# Check if running in container
-cat /.dockerenv 2>/dev/null && echo "Docker container" || echo "Not Docker"
+# Check container detection manually
+python -c "
+from ssh_agent import SSHAgent
+agent = SSHAgent('container.local', 'user')
+agent.connect_with_key('~/.ssh/id_rsa')
+env = agent.smart_executor._collect_comprehensive_environment_info()
+env_type = env['environment_type']
+print('Container:', env_type['is_container'])
+print('Type:', env_type['container_type'])
+print('Limitations:', env_type['limitations'])
+print('Capabilities:', env_type['capabilities'])
+if 'platform_specific' in env_type:
+    ps = env_type['platform_specific']
+    print('Apple Silicon:', ps.get('is_apple_silicon', False))
+    print('Evidence:', ps.get('apple_silicon_indicators', []))
+"
+```
 
-# Check container capabilities
-systemctl --version 2>/dev/null && echo "systemd available" || echo "No systemd"
+### Plan Discussion Issues
+```bash
+# If plan discussion doesn't work, check LLM connectivity
+python ssh_agent_cli.py -H server.com -u user -k ~/.ssh/id_rsa -m smart -t "test" --discuss-plan
 
-# Check for container limitations
-cat /proc/1/cgroup | grep -E "(docker|lxc|containerd)" && echo "Container detected"
+# Enable debug logging
+export SSH_AGENT_LOG_LEVEL=DEBUG
+python ssh_agent_cli.py -H server.com -u user -k ~/.ssh/id_rsa -m smart -t "install nginx" --discuss-plan
+```
+
+### Replanning Issues
+```bash
+# Enable debug logging to see replanning process
+export SSH_AGENT_LOG_LEVEL=DEBUG
+python ssh_agent_cli.py -H server.com -u user -t "install missing-package"
+
+# Check for critical failure detection
+# Look for log messages like:
+# "Critical installation failure detected"
+# "Triggering immediate replanning"
+# "Replanning successful: X new steps generated"
 ```
 
 ### Cache Issues
@@ -615,12 +817,15 @@ The authors are not responsible for any damage caused by misuse of this tool. Th
 ## Version Information
 
 This README reflects the current codebase features including:
-- Container environment detection and adaptation
+- Container environment detection and adaptation (including Apple Silicon)
 - Advanced failure recovery with automatic replanning
 - Prerequisite-informed planning
 - Automatic value generation with placeholders
 - Environment caching for performance
 - Smart exit code interpretation
 - LLM-powered failure analysis
+- Interactive plan discussion and modification
+- Enhanced execution mode with safeguards
+- Sophisticated container capability assessment
 
 For the most up-to-date feature list, check the source code in the `ssh_agent/` directory.
