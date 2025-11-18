@@ -808,11 +808,13 @@ This tool executes commands on remote servers and can automatically generate val
 - Maintaining proper backups before system changes
 - Following security best practices
 - Reviewing auto-generated values for security compliance
-- Understanding container environment limitations
+- Understanding container environment implications
+- Reviewing AI-generated plans before execution
+- Securing plan discussion sessions
 - Complying with organizational policies
 - Monitoring cache files and generated credentials
 
-The authors are not responsible for any damage caused by misuse of this tool. The automatic failure recovery and replanning features are designed to help but may not prevent all issues.
+The authors are not responsible for any damage caused by misuse of this tool. The automatic failure recovery, replanning features, and plan discussion are designed to help but may not prevent all issues.
 
 ## Version Information
 
