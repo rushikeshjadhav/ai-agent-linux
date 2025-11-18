@@ -65,7 +65,7 @@ class EnhancedExecutor:
         self.max_attempts = 3
         self.snapshots: List[SystemSnapshot] = []
         
-    def execute_enhanced_task(self, goal: str, auto_approve: bool = False, 
+    def execute_enhanced_task(self, goal: str, auto_approve: bool = False, discuss_plan: bool = False,
                             human_callback: Optional[callable] = None) -> EnhancedTaskResult:
         """Execute task with full safeguards and retry logic"""
         logger.info(f"Starting enhanced execution: {goal}")
@@ -91,6 +91,25 @@ class EnhancedExecutor:
             # Phase 4: Plan Refinement with LLM
             phases.append(ExecutionPhase.PLAN_REFINEMENT.value)
             initial_plan = self._create_refined_plan(goal, prerequisites)
+            
+            # NEW: Plan Discussion Phase
+            if discuss_plan:
+                phases.append("plan_discussion")
+                logger.info("=== PLAN DISCUSSION PHASE ===")
+                initial_plan = self._discuss_enhanced_plan_with_user(initial_plan, goal, prerequisites)
+                
+                if not initial_plan:
+                    return EnhancedTaskResult(
+                        task_description=goal,
+                        final_success=False,
+                        total_attempts=0,
+                        execution_phases=phases,
+                        attempts=[],
+                        snapshots=self.snapshots,
+                        human_escalation_required=False,
+                        rollback_performed=False,
+                        final_message="Plan discussion cancelled by user"
+                    )
             
             # Phase 5: Execution with retries
             phases.append(ExecutionPhase.EXECUTION.value)
