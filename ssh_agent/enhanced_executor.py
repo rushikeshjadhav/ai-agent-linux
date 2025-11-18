@@ -618,3 +618,261 @@ class EnhancedExecutor:
         logger.info("Package state rollback would require manual intervention")
         
         return rollback_success
+    
+    def _discuss_enhanced_plan_with_user(self, action_plan: ActionPlan, goal: str, 
+                                       prerequisites: Dict[str, Any]) -> Optional[ActionPlan]:
+        """Enhanced plan discussion with safeguard information"""
+        
+        while True:
+            # Display the enhanced plan with safeguard info
+            self._display_enhanced_action_plan(action_plan, prerequisites)
+            
+            print("\n🛡️ Enhanced Plan Review Options:")
+            print("1. Execute plan with full safeguards")
+            print("2. Suggest modifications")
+            print("3. Cancel execution")
+            print("4. Show detailed step information")
+            print("5. Show safeguard details")
+            print("6. Show prerequisite analysis")
+            
+            choice = input("\nChoose option (1-6): ").strip()
+            
+            if choice == "1":
+                print("✅ Proceeding with enhanced plan execution...")
+                return action_plan
+            
+            elif choice == "2":
+                modifications = input("\n💭 Describe your suggested modifications: ").strip()
+                if modifications:
+                    print("🔄 Revising enhanced plan based on your suggestions...")
+                    revised_plan = self._revise_enhanced_plan_with_user_input(
+                        action_plan, modifications, goal, prerequisites
+                    )
+                    if revised_plan:
+                        action_plan = revised_plan
+                        print("✅ Enhanced plan revised successfully!")
+                    else:
+                        print("❌ Failed to revise plan. Showing original plan.")
+                else:
+                    print("❌ No modifications provided.")
+            
+            elif choice == "3":
+                print("❌ Enhanced plan execution cancelled by user.")
+                return None
+            
+            elif choice == "4":
+                self._show_enhanced_step_details(action_plan)
+            
+            elif choice == "5":
+                self._show_safeguard_details()
+            
+            elif choice == "6":
+                self._show_prerequisite_analysis(prerequisites)
+            
+            else:
+                print("❌ Invalid choice. Please enter 1-6.")
+
+    def _display_enhanced_action_plan(self, action_plan: ActionPlan, prerequisites: Dict[str, Any]):
+        """Display enhanced action plan with safeguard information"""
+        print(f"\n🛡️ Enhanced Action Plan for: {action_plan.goal}")
+        print(f"⏱️  Estimated time: {action_plan.estimated_time}")
+        print(f"🛡️  Safety score: {action_plan.safety_score:.1f}/1.0")
+        print(f"📊 Max retry attempts: {self.max_attempts}")
+        
+        # Show safeguard status
+        if self.snapshots:
+            latest_snapshot = self.snapshots[-1]
+            print(f"📸 System snapshot created: {latest_snapshot.timestamp}")
+            print(f"   📦 Packages tracked: {len(latest_snapshot.packages)}")
+            print(f"   🔧 Services tracked: {len(latest_snapshot.services)}")
+        
+        print(f"\n📝 Enhanced Steps ({len(action_plan.steps)} total):")
+        for i, step in enumerate(action_plan.steps, 1):
+            command = step.get("command", "")
+            description = step.get("description", "")
+            
+            # Truncate long commands for display
+            display_command = command if len(command) <= 60 else command[:57] + "..."
+            
+            print(f"  {i:2d}. {description}")
+            print(f"      💻 {display_command}")
+            
+            # Show enhanced step features
+            safety_check = step.get("safety_check", "")
+            if safety_check:
+                print(f"      🛡️  Safety check: {safety_check}")
+            
+            rollback_cmd = step.get("rollback_command", "")
+            if rollback_cmd:
+                print(f"      ↩️  Rollback: {rollback_cmd}")
+            
+            risk_level = step.get("risk_level", "")
+            if risk_level:
+                risk_emoji = {"low": "🟢", "medium": "🟡", "high": "🔴"}.get(risk_level, "⚪")
+                print(f"      {risk_emoji} Risk level: {risk_level}")
+        
+        # Show enhanced risks
+        if action_plan.risks:
+            print(f"\n⚠️  Enhanced Risk Analysis:")
+            for risk in action_plan.risks:
+                print(f"  • {risk}")
+            print(f"  🛡️  Mitigation: System snapshots and automatic rollback available")
+
+    def _show_enhanced_step_details(self, action_plan: ActionPlan):
+        """Show detailed information about enhanced steps"""
+        print(f"\n📖 Enhanced Step Details:")
+        
+        for i, step in enumerate(action_plan.steps, 1):
+            print(f"\n--- Enhanced Step {i} ---")
+            print(f"Description: {step.get('description', 'No description')}")
+            print(f"Command: {step.get('command', 'No command')}")
+            
+            safety_check = step.get("safety_check", "")
+            if safety_check:
+                print(f"Safety check: {safety_check}")
+            
+            rollback_cmd = step.get("rollback_command", "")
+            if rollback_cmd:
+                print(f"Rollback command: {rollback_cmd}")
+            
+            risk_level = step.get("risk_level", "")
+            if risk_level:
+                print(f"Risk level: {risk_level}")
+
+    def _show_safeguard_details(self):
+        """Show details about active safeguards"""
+        print(f"\n🛡️ Active Safeguards:")
+        print(f"  📸 System snapshots: {len(self.snapshots)} created")
+        print(f"  🔄 Max retry attempts: {self.max_attempts}")
+        print(f"  ↩️  Automatic rollback: Available")
+        print(f"  👤 Human escalation: Available")
+        
+        if self.snapshots:
+            latest = self.snapshots[-1]
+            print(f"\n📸 Latest Snapshot ({latest.timestamp}):")
+            print(f"  📦 Packages: {len(latest.packages)} tracked")
+            print(f"  🔧 Services: {len(latest.services)} tracked")
+            print(f"  💾 Disk usage: Recorded")
+            print(f"  🔄 Processes: {len(latest.running_processes)} tracked")
+
+    def _show_prerequisite_analysis(self, prerequisites: Dict[str, Any]):
+        """Show prerequisite analysis details"""
+        print(f"\n🔍 Prerequisite Analysis:")
+        
+        env_info = prerequisites.get("environment", {})
+        if env_info:
+            print(f"  🌍 Environment: Analyzed")
+            
+            # Show distribution info
+            distribution = env_info.get("distribution", {})
+            if distribution.get("os_release"):
+                print(f"    OS: {distribution['os_release']}")
+            
+            # Show package managers
+            pkg_managers = env_info.get("package_manager", {})
+            available_pm = [pm for pm, info in pkg_managers.items() if info.get("available", False)]
+            if available_pm:
+                print(f"    Package managers: {', '.join(available_pm)}")
+        
+        system_info = prerequisites.get("system_info", {})
+        if system_info:
+            print(f"  💻 System info: {len(system_info)} commands executed")
+        
+        package_state = prerequisites.get("package_state", {})
+        if package_state:
+            print(f"  📦 Package state: Analyzed")
+        
+        service_state = prerequisites.get("service_state", {})
+        if service_state:
+            print(f"  🔧 Service state: Analyzed")
+
+    def _revise_enhanced_plan_with_user_input(self, original_plan: ActionPlan, user_modifications: str,
+                                            goal: str, prerequisites: Dict[str, Any]) -> Optional[ActionPlan]:
+        """Revise enhanced plan based on user input"""
+        
+        if not hasattr(self, 'analyzer') or not self.analyzer._client:
+            print("❌ LLM not available for enhanced plan revision")
+            return None
+        
+        prompt = f"""
+        The user has reviewed the enhanced action plan and requested modifications. Please revise the plan accordingly.
+        
+        ORIGINAL GOAL: {goal}
+        
+        ORIGINAL ENHANCED PLAN:
+        Goal: {original_plan.goal}
+        Steps: {json.dumps([{
+            'description': step.get('description', ''), 
+            'command': step.get('command', ''),
+            'safety_check': step.get('safety_check', ''),
+            'rollback_command': step.get('rollback_command', ''),
+            'risk_level': step.get('risk_level', '')
+        } for step in original_plan.steps], indent=2)}
+        Risks: {original_plan.risks}
+        Safety Score: {original_plan.safety_score}
+        
+        USER MODIFICATIONS REQUESTED:
+        {user_modifications}
+        
+        PREREQUISITES CONTEXT:
+        {json.dumps(prerequisites, indent=2)[:1000]}
+        
+        ENHANCED EXECUTION CONTEXT:
+        - System snapshots are available for rollback
+        - Multiple retry attempts will be made
+        - Human escalation is available
+        - Each step can have safety checks and rollback commands
+        
+        Please create a revised enhanced action plan that:
+        1. Incorporates the user's requested modifications
+        2. Maintains enhanced execution features (safety checks, rollback commands, risk levels)
+        3. Keeps the same JSON format with enhanced fields
+        4. Explains what changes were made and why
+        5. Ensures all steps have appropriate safety measures
+        
+        Each step should include:
+        - command: the actual command
+        - description: what this does
+        - safety_check: verification command (if needed)
+        - rollback_command: how to undo if needed
+        - risk_level: low/medium/high
+        
+        If the user's modifications are unsafe, explain why and suggest safer alternatives.
+        
+        Respond in JSON format with enhanced step fields and a "revision_notes" field.
+        """
+        
+        try:
+            response = self.analyzer._call_llm(prompt)
+            
+            fallback_data = {
+                "goal": original_plan.goal,
+                "steps": original_plan.steps,
+                "risks": original_plan.risks + ["Enhanced plan revision failed"],
+                "estimated_time": original_plan.estimated_time,
+                "safety_score": original_plan.safety_score,
+                "revision_notes": "Failed to parse enhanced revision response"
+            }
+            
+            revised_data = self.analyzer._robust_json_parse(response, fallback_data)
+            
+            # Show revision notes to user
+            revision_notes = revised_data.get("revision_notes", "No revision notes provided")
+            print(f"\n📝 Enhanced Plan Revision Notes:")
+            print(f"   {revision_notes}")
+            
+            # Create revised ActionPlan
+            revised_plan = ActionPlan(
+                goal=revised_data.get("goal", original_plan.goal),
+                steps=revised_data.get("steps", original_plan.steps),
+                risks=revised_data.get("risks", original_plan.risks),
+                estimated_time=revised_data.get("estimated_time", original_plan.estimated_time),
+                safety_score=float(revised_data.get("safety_score", original_plan.safety_score))
+            )
+            
+            return revised_plan
+            
+        except Exception as e:
+            logger.error(f"Enhanced plan revision failed: {e}")
+            print(f"❌ Failed to revise enhanced plan: {e}")
+            return None
