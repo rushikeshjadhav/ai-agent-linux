@@ -1528,7 +1528,7 @@ class SmartExecutor:
         task_lower = task_description.lower()
         return any(keyword in task_lower for keyword in system_changing_keywords)
     
-    def execute_task(self, task_description: str, auto_approve: bool = False) -> TaskResult:
+    def execute_task(self, task_description: str, auto_approve: bool = False, discuss_plan: bool = False) -> TaskResult:
         """Break down complex tasks into commands using LLM with recursive failure recovery"""
         logger.info(f"Starting smart task execution: {task_description}")
         
@@ -1543,7 +1543,7 @@ class SmartExecutor:
             self._invalidate_environment_cache()
         
         # Initial execution attempt
-        result = self._execute_task_attempt(task_description, auto_approve)
+        result = self._execute_task_attempt(task_description, auto_approve, discuss_plan)
         
         # Recursive recovery loop
         while not result.success and recovery_attempts < self.max_recovery_attempts:
@@ -1614,7 +1614,7 @@ class SmartExecutor:
         
         return result
     
-    def _execute_task_attempt(self, task_description: str, auto_approve: bool = False) -> TaskResult:
+    def _execute_task_attempt(self, task_description: str, auto_approve: bool = False, discuss_plan: bool = False) -> TaskResult:
         """Execute a single task attempt with prerequisite-informed planning"""
         logger.info("=== PHASE 1: Environment Collection ===")
         env_info = self._collect_comprehensive_environment_info()
@@ -1657,6 +1657,21 @@ class SmartExecutor:
             )
         
         logger.info(f"Generated plan with {len(action_plan.steps)} steps based on prerequisites")
+        
+        # NEW: Plan Discussion Phase
+        if discuss_plan:
+            logger.info("=== PHASE 5: Plan Discussion ===")
+            action_plan = self._discuss_plan_with_user(action_plan, task_description, env_info, prerequisite_results)
+            
+            if not action_plan:
+                return TaskResult(
+                    task_description=task_description,
+                    success=False,
+                    steps_completed=0,
+                    total_steps=0,
+                    results=[],
+                    error_message="Plan discussion cancelled by user"
+                )
         
         # Continue with existing execution logic...
         current_state = self.context.get_current_state()

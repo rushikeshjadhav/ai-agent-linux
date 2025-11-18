@@ -118,7 +118,7 @@ class SSHAgent:
             "current_state_summary": self.context.get_context_summary()
         }
     
-    def execute_smart_action(self, goal: str, auto_approve: bool = False) -> TaskResult:
+    def execute_smart_action(self, goal: str, auto_approve: bool = False, discuss_plan: bool = False) -> TaskResult:
         """Let LLM plan and execute a series of commands to achieve a goal"""
         if not self.connected or not self.smart_executor:
             return TaskResult(
@@ -130,7 +130,7 @@ class SSHAgent:
                 error_message="Agent not connected"
             )
         
-        return self.smart_executor.execute_task(goal, auto_approve)
+        return self.smart_executor.execute_task(goal, auto_approve, discuss_plan)
     
     def manage_service(self, service_name: str, action: str) -> ServiceResult:
         """Intelligent service management"""

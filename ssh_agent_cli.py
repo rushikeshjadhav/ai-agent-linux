@@ -216,7 +216,7 @@ class SSHAgentCLI:
             print("❌ Connection failed!")
             return False
     
-    def execute_task(self, task: str, auto_approve: bool = False):
+    def execute_task(self, task: str, auto_approve: bool = False, discuss_plan: bool = False):
         """Execute a user-specified task"""
         if not self.connected or not self.agent:
             print("❌ Not connected to server")
@@ -229,10 +229,10 @@ class SSHAgentCLI:
             print("🧠 Using intelligent execution...")
             
             # Use provided auto_approve or ask for approval
-            if not auto_approve:
+            if not auto_approve and not discuss_plan:
                 auto_approve = input("Auto-approve all steps? (y/N): ").lower().startswith('y')
             
-            result = self.agent.execute_smart_action(task, auto_approve)
+            result = self.agent.execute_smart_action(task, auto_approve, discuss_plan)
             
             print(f"📋 Task: {result.task_description}")
             print(f"✅ Success: {result.success}")
@@ -465,7 +465,8 @@ class SSHAgentCLI:
             
             # Execute specific task if provided
             if args.task:
-                self.execute_task(args.task, args.auto_approve)
+                discuss_plan = getattr(args, 'discuss_plan', False)
+                self.execute_task(args.task, args.auto_approve, discuss_plan)
             else:
                 # Run interactive session
                 self.interactive_session()
@@ -547,6 +548,12 @@ Environment Variables:
         "--auto-approve",
         action="store_true",
         help="Auto-approve all steps in intelligent mode"
+    )
+    
+    parser.add_argument(
+        "--discuss-plan",
+        action="store_true",
+        help="Show action plan and allow user review/modification before execution"
     )
     
     parser.add_argument(
